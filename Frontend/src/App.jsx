@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { fetchHistory, fetchState, openChatWs } from './lib/api'
+import { fetchHistory, fetchMemory, fetchState, openChatWs } from './lib/api'
 
 function App() {
   const [username, setUsername] = useState(() => localStorage.getItem('username') || '')
@@ -11,6 +11,8 @@ function App() {
   const [affection, setAffection] = useState(0)
   const [stage, setStage] = useState('Cold / Defensive')
   const [error, setError] = useState('')
+  const [memory, setMemory] = useState(null)
+  const [memoryLoading, setMemoryLoading] = useState(false)
 
   const wsRef = useRef(null)
   const listRef = useRef(null)
@@ -29,7 +31,19 @@ function App() {
 
   async function loadUserData(u) {
     setError('')
-    const [h, s] = await Promise.all([fetchHistory(u), fetchState(u)])
+    const [h, s, m] = await Promise.all([
+      fetchHistory(u), 
+      fetchState(u), 
+      fetchMemory(u).catch((e) => {
+        console.error('Failed to load memory:', e)
+        return {
+          identity_facts: [],
+          episodic_memories: [],
+          semantic_profile: null,
+          working_memory_count: 0
+        }
+      })
+    ])
     setMessages(
       h.map((m) => ({
         id: m.id,
@@ -42,6 +56,43 @@ function App() {
     )
     setAffection(s.affection_score)
     setStage(s.persona_stage)
+    setMemory(m || {
+      identity_facts: [],
+      episodic_memories: [],
+      semantic_profile: null,
+      working_memory_count: 0
+    })
+  }
+
+  async function refreshMemory() {
+    if (!username) return
+    setMemoryLoading(true)
+    try {
+      console.log('[Frontend] Fetching memory for:', username)
+      const m = await fetchMemory(username)
+      console.log('[Frontend] Memory received:', {
+        facts: m?.identity_facts?.length || 0,
+        episodic: m?.episodic_memories?.length || 0,
+        working: m?.working_memory_count || 0,
+        hasProfile: !!m?.semantic_profile
+      })
+      setMemory(m || {
+        identity_facts: [],
+        episodic_memories: [],
+        semantic_profile: null,
+        working_memory_count: 0
+      })
+    } catch (e) {
+      console.error('[Frontend] Failed to refresh memory:', e)
+      setMemory({
+        identity_facts: [],
+        episodic_memories: [],
+        semantic_profile: null,
+        working_memory_count: 0
+      })
+    } finally {
+      setMemoryLoading(false)
+    }
   }
 
   function disconnectWs() {
@@ -87,6 +138,8 @@ function App() {
         ])
         setAffection(data.emotion_score)
         setStage(data.emotion_label)
+        // Refresh memory after AI response
+        refreshMemory()
       } catch {
         setError('Bad message from server.')
       }
@@ -153,11 +206,13 @@ function App() {
     ])
     setComposer('')
     wsRef.current.send(JSON.stringify({ message: text }))
+    // Refresh memory after sending message
+    setTimeout(() => refreshMemory(), 1000)
   }
 
   return (
     <div className="app">
-      <div className="panel">
+      <div className="panel chatPanel">
         <div className="topbar">
           <div className="brand">
             <div className="brandTitle">Tsundere Chat (LangGraph + MongoDB)</div>
@@ -253,6 +308,84 @@ function App() {
           )}
         </div>
       </div>
+
+      {/* Memory Sidebar */}
+      {isLoggedIn && (
+        <div className="memorySidebar">
+          <div className="memoryHeader">
+            <h3>Memory System</h3>
+            <button className="btnGhost btnSmall" onClick={refreshMemory} disabled={memoryLoading}>
+              {memoryLoading ? '...' : '↻'}
+            </button>
+          </div>
+
+          <div className="memoryContent">
+            {/* Identity Memory */}
+            <div className="memorySection">
+              <h4>Identity Facts</h4>
+              {memory && memory.identity_facts && memory.identity_facts.length > 0 ? (
+                <div className="memoryList">
+                  {memory.identity_facts.map((fact, idx) => (
+                    <div key={idx} className="memoryItem">
+                      <div className="memoryItemKey">{fact.key}:</div>
+                      <div className="memoryItemValue">{fact.value}</div>
+                      <div className="memoryItemMeta">Confidence: {(fact.confidence * 100).toFixed(0)}%</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="memoryEmpty">No facts stored yet</div>
+              )}
+            </div>
+
+            {/* Episodic Memory */}
+            <div className="memorySection">
+              <h4>Episodic Memories ({memory?.episodic_memories?.length || 0})</h4>
+              {memory && memory.episodic_memories && memory.episodic_memories.length > 0 ? (
+                <div className="memoryList">
+                  {memory.episodic_memories.slice(0, 10).map((mem, idx) => (
+                    <div key={idx} className="memoryItem memoryItemEpisodic">
+                      <div className="memoryItemValue">{mem.event_summary}</div>
+                      <div className="memoryItemMeta">
+                        Importance: {(mem.importance_score * 100).toFixed(0)}% · 
+                        Accessed: {mem.access_count}× · 
+                        {new Date(mem.timestamp).toLocaleDateString()}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="memoryEmpty">No significant events yet</div>
+              )}
+            </div>
+
+            {/* Semantic Profile */}
+            <div className="memorySection">
+              <h4>Semantic Profile</h4>
+              {memory && memory.semantic_profile ? (
+                <div className="memoryItem">
+                  <div className="memoryItemValue">{memory.semantic_profile.personality_summary}</div>
+                  {memory.semantic_profile.behavior_patterns && memory.semantic_profile.behavior_patterns.length > 0 && (
+                    <div className="memoryItemMeta">
+                      Patterns: {memory.semantic_profile.behavior_patterns.slice(0, 3).join(', ')}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="memoryEmpty">No profile generated yet</div>
+              )}
+            </div>
+
+            {/* Working Memory */}
+            <div className="memorySection">
+              <h4>Working Memory</h4>
+              <div className="memoryItem">
+                <div className="memoryItemValue">Last {memory?.working_memory_count || 0} conversation turns</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

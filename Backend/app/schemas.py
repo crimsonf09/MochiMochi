@@ -36,3 +36,29 @@ class WsServerMessage(BaseModel):
     emotion_label: str
     timestamp: datetime
 
+
+class IdentityFact(BaseModel):
+    key: str
+    value: str
+    confidence: float
+
+
+class EpisodicMemory(BaseModel):
+    event_summary: str
+    importance_score: float
+    timestamp: datetime
+    access_count: int
+
+
+class SemanticProfile(BaseModel):
+    personality_summary: str
+    preferences: dict
+    behavior_patterns: list[str]
+
+
+class MemoryData(BaseModel):
+    identity_facts: list[IdentityFact]
+    episodic_memories: list[EpisodicMemory]
+    semantic_profile: SemanticProfile
+    working_memory_count: int
+

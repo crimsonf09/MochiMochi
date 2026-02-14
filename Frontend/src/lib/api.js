@@ -36,3 +36,10 @@ export function openChatWs(username) {
   return new WebSocket(url)
 }
 
+export async function fetchMemory(username) {
+  // Use relative URL if API_BASE is empty (goes through Vite proxy)
+  const url = API_BASE ? `${API_BASE}/chat/memory/${encodeURIComponent(username)}` : `/chat/memory/${encodeURIComponent(username)}`
+  const r = await fetch(url)
+  if (!r.ok) throw new Error(`Memory fetch failed: ${r.status}`)
+  return await r.json()
+}
