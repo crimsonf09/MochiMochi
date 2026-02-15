@@ -36,11 +36,11 @@ class GraphState(TypedDict, total=False):
     working_memory: list[dict[str, Any]]  # Short-term context
     episodic_memories: list[Any]  # Retrieved episodic memories
     semantic_profile: dict[str, Any]  # Behavior patterns
+    prev_ai_emotion_3d: dict[str, float] | None  # Previous AI message's 3D emotion
 
     # Derived
     delta: int
     new_score: int
-    emotion_label: str
     ai_message: str
     
     # 3D Emotion Scores (LLM-judged)
@@ -72,7 +72,9 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
     # Current emotion state: derive from latest AI message's 3D emotion, else default
     latest_ai = await coll.find_one({"username": username, "role": "ai"}, sort=[("timestamp", -1)])
     if latest_ai and "emotion_3d" in latest_ai:
-        prev_score, _ = _derive_persona_from_emotion_3d(latest_ai.get("emotion_3d"))
+        prev_affection = _derive_affection_from_emotion_3d(latest_ai.get("emotion_3d"))
+        # Convert affection (0-10) to score (-10 to 10) for backward compatibility
+        prev_score = (prev_affection / 10.0) * 20.0 - 10.0
     else:
         prev_score = 0
 
@@ -82,6 +84,11 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
 
     # Load semantic profile
     semantic_profile = await get_semantic_profile(deps.db, username)
+    
+    # Get previous AI emotion_3d for use in prompt
+    prev_ai_emotion_3d = None
+    if latest_ai and "emotion_3d" in latest_ai:
+        prev_ai_emotion_3d = latest_ai.get("emotion_3d")
 
     return {
         "history": history,
@@ -89,6 +96,7 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
         "prev_score": prev_score,
         "identity_facts": identity_dict,
         "semantic_profile": semantic_profile,
+        "prev_ai_emotion_3d": prev_ai_emotion_3d,  # Store for use in LLM prompt
     }
 
 
@@ -207,33 +215,18 @@ def _calculate_emotion_score_from_3d(emotion_3d: dict[str, float] | None) -> flo
     return score
 
 
-def _derive_persona_from_emotion_3d(emotion_3d: dict[str, float] | None) -> tuple[int, str]:
+def _derive_affection_from_emotion_3d(emotion_3d: dict[str, float] | None) -> float:
     """
-    Derive persona stage and affection score from 3D emotion.
+    Derive affection score from 3D emotion.
     Uses the new affection_score calculation (0-10) based on all three dimensions.
     """
     if not emotion_3d:
-        return 0, "Cold / Defensive"
+        return 5.0  # Neutral default
     
     # Calculate affection score (0-10) using all three dimensions
     affection_score = calculate_affection_score_from_3d(emotion_3d)
     
-    # Convert to integer and map to persona stage
-    # Map 0-10 affection score to tsundere stages
-    if affection_score <= 2.0:
-        stage = "Hostile Tsundere"
-        affection = -3
-    elif affection_score <= 4.0:
-        stage = "Cold / Defensive"
-        affection = 0
-    elif affection_score <= 7.0:
-        stage = "Soft Tsundere"
-        affection = 3
-    else:
-        stage = "Dere Mode"
-        affection = 5
-    
-    return affection, stage
+    return affection_score
 
 
 def _calculate_weighted_emotion_score(
@@ -331,12 +324,6 @@ async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
         max_impact_delta=2.0  # Maximum change of ±2.0 per message
     )
     
-    # Derive persona stage from new weighted score
-    # Convert score to valence-like value for stage mapping
-    score_valence = new_score / 5.0  # Normalize to -1.0 to 1.0 range
-    score_emotion_3d = {"valence": max(-1.0, min(1.0, score_valence))}
-    _, emotion_label = _derive_persona_from_emotion_3d(score_emotion_3d)
-    
     delta = new_score - prev_score
     print(f"[EmotionJudge] Score: prev={prev_score:.2f}, current={current_score:.2f}, new={new_score:.2f}, delta={delta:.2f} (capped at ±2.0)")
     
@@ -347,7 +334,6 @@ async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
         "user_emotion_3d": user_emotion_dict,
         "delta": delta,
         "new_score": new_score,
-        "emotion_label": emotion_label,
         "user_affection_score": user_affection_score  # Store user's affection score (0-10)
     }
 
@@ -358,8 +344,6 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
     Includes: system prompt, identity facts, episodic memories, semantic profile,
     working memory, and current user message.
     """
-    stage = state["emotion_label"]
-    
     # Calculate affection score (0-10) from weighted emotion score
     # Use the new weighted score to derive affection
     new_score = state.get("new_score", 0)
@@ -372,8 +356,30 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
     # Calculate user's affection score from their 3D emotion
     user_affection_score = calculate_affection_score_from_3d(user_emotion_3d)
     
+    # Get AI's current 3D emotion from previous AI message
+    # Use prev_ai_emotion_3d from state (loaded from latest AI message)
+    prev_ai_emotion_3d = state.get("prev_ai_emotion_3d", {})
+    
+    if prev_ai_emotion_3d:
+        ai_valence = prev_ai_emotion_3d.get("valence", 0.0)
+        ai_arousal = prev_ai_emotion_3d.get("arousal", 0.5)
+        ai_dominance = prev_ai_emotion_3d.get("dominance", 0.5)
+    else:
+        # Derive from weighted affection score if no previous emotion available
+        # Map affection (0-10) to valence (-1 to 1)
+        ai_valence = (ai_affection_score / 10.0) * 2.0 - 1.0  # Maps 0->-1, 5->0, 10->1
+        # Use moderate arousal and dominance as defaults
+        ai_arousal = 0.5
+        ai_dominance = 0.5
+    
     # Build enhanced system prompt with memory context and emotion scores
-    system_parts = [persona_system_prompt(stage, int(ai_affection_score), user_affection_score)]
+    system_parts = [persona_system_prompt(
+        ai_affection=ai_affection_score,
+        user_affection=user_affection_score,
+        ai_valence=ai_valence,
+        ai_arousal=ai_arousal,
+        ai_dominance=ai_dominance
+    )]
     
     # Add identity facts
     identity_facts = state.get("identity_facts", {})
@@ -422,7 +428,6 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
     Falls back to deterministic responder if GPT is unavailable.
     Includes retry logic with exponential backoff for rate limits.
     """
-    stage = state["emotion_label"]
     new_score = state.get("new_score", 0)
     user_emotion_3d = state.get("user_emotion_3d", {})
     
@@ -686,30 +691,26 @@ async def _persist(state: GraphState, deps: GraphDeps) -> GraphState:
     user_emotion_3d = state.get("user_emotion_3d", {"valence": 0.0, "arousal": 0.5, "dominance": 0.5, "impact": 0.3})
     ai_emotion_3d = state.get("ai_emotion_3d", {"valence": 0.0, "arousal": 0.5, "dominance": 0.5, "impact": 0.3})
 
-    # Store user message - derive emotion_label from user's 3D emotion
+    # Store user message
     prev_score = int(state.get("prev_score", 0))
-    _, prev_label = _derive_persona_from_emotion_3d(user_emotion_3d)
     await coll.insert_one(
         {
             "username": username,
             "role": "user",
             "message": state["user_message"],
             "emotion_score": prev_score,
-            "emotion_label": prev_label,
             "emotion_3d": user_emotion_3d,
             "timestamp": ts,
         }
     )
     
-    # Store AI message - derive emotion_label from AI's 3D emotion
-    _, ai_label = _derive_persona_from_emotion_3d(ai_emotion_3d)
+    # Store AI message
     await coll.insert_one(
         {
             "username": username,
             "role": "ai",
             "message": state["ai_message"],
             "emotion_score": score,
-            "emotion_label": ai_label,
             "emotion_3d": ai_emotion_3d,
             "timestamp": ts,
         }

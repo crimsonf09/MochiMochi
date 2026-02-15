@@ -22,15 +22,15 @@ class ChatMessage(BaseModel):
     role: Role
     message: str
     emotion_score: int
-    emotion_label: str
+    emotion_label: Optional[str] = ""  # Deprecated, kept for backward compatibility
     emotion_3d: Optional[Emotion3D] = None
     timestamp: datetime
 
 
 class ChatState(BaseModel):
     username: str
-    affection_score: int
-    persona_stage: str
+    affection_score: int  # 0-10
+    persona_stage: str = ""  # Deprecated, kept for backward compatibility
 
 
 class WsClientMessage(BaseModel):
@@ -41,7 +41,7 @@ class WsServerMessage(BaseModel):
     role: Literal["ai"] = "ai"
     message: str
     emotion_score: int
-    emotion_label: str
+    emotion_label: str = ""  # Deprecated, kept for backward compatibility
     emotion_3d: Optional[Emotion3D] = None
     timestamp: datetime
 

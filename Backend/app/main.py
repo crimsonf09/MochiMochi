@@ -147,12 +147,14 @@ async def get_chat_state(username: str):
         coll = db["chat_messages"]
         latest_ai = await coll.find_one({"username": username, "role": "ai"}, sort=[("timestamp", -1)])
         if latest_ai and "emotion_3d" in latest_ai:
-            from .graph import _derive_persona_from_emotion_3d
-            score, stage = _derive_persona_from_emotion_3d(latest_ai.get("emotion_3d"))
+            from .graph import _derive_affection_from_emotion_3d
+            affection_score = _derive_affection_from_emotion_3d(latest_ai.get("emotion_3d"))
+            # Convert affection (0-10) to score (-10 to 10) for backward compatibility
+            score = int((affection_score / 10.0) * 20.0 - 10.0)
         else:
             score = 0
-            stage = "Cold / Defensive"
-        return {"username": username, "affection_score": score, "persona_stage": stage}
+            affection_score = 5.0
+        return {"username": username, "affection_score": int(affection_score), "persona_stage": ""}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
@@ -239,7 +241,7 @@ async def ws_chat(websocket: WebSocket, username: str):
             server_msg = WsServerMessage(
                 message=result["ai_message"],
                 emotion_score=int(result["new_score"]),
-                emotion_label=result["emotion_label"],
+                emotion_label="",  # No longer used, kept for backward compatibility
                 emotion_3d=emotion_3d_obj,
                 timestamp=result.get("timestamp") or datetime.utcnow(),
             )

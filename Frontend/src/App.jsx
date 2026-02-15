@@ -9,7 +9,6 @@ function App() {
   const [composer, setComposer] = useState('')
   const [connStatus, setConnStatus] = useState('disconnected') // disconnected | connecting | connected
   const [affection, setAffection] = useState(0)
-  const [stage, setStage] = useState('Cold / Defensive')
   const [error, setError] = useState('')
   const [memory, setMemory] = useState(null)
   const [memoryLoading, setMemoryLoading] = useState(false)
@@ -50,13 +49,12 @@ function App() {
         role: m.role,
         text: m.message,
         emotionScore: m.emotion_score,
-        emotionLabel: m.emotion_label,
+        emotionLabel: m.emotion_label || '',  // Deprecated, kept for backward compatibility
         emotion3d: m.emotion_3d || null,
         timestamp: m.timestamp,
       })),
     )
     setAffection(s.affection_score)
-    setStage(s.persona_stage)
     setMemory(m || {
       identity_facts: [],
       episodic_memories: [],
@@ -139,7 +137,6 @@ function App() {
           },
         ])
         setAffection(data.emotion_score)
-        setStage(data.emotion_label)
         // Refresh memory after AI response
         refreshMemory()
       } catch {
@@ -183,7 +180,6 @@ function App() {
     setComposer('')
     setError('')
     setAffection(0)
-    setStage('Cold / Defensive')
   }
 
   function sendMessage() {
@@ -202,7 +198,7 @@ function App() {
         role: 'user',
         text,
         emotionScore: affection,
-        emotionLabel: stage,
+        emotionLabel: '',  // No longer used
         emotion3d: null, // Will be updated when message is processed
         timestamp: new Date().toISOString(),
       },
@@ -231,8 +227,7 @@ function App() {
           </div>
           {isLoggedIn && (
             <div className="statusPills">
-              <span className="pill pillStrong">Affection: {affection}</span>
-              <span className="pill">Stage: {stage}</span>
+              <span className="pill pillStrong">Affection: {affection}/10</span>
               <button className="btnGhost" onClick={onLogout}>
                 Switch user
               </button>
@@ -279,7 +274,6 @@ function App() {
                       {m.text}
                       {m.role === 'ai' && (
                         <div className="bubbleMeta">
-                          <span className="badge">{m.emotionLabel}</span>
                           <span className="badge">Affection: {m.emotionScore}</span>
                           {m.emotion3d && (
                             <div className="emotion3d">
