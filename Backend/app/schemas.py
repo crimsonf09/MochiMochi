@@ -9,6 +9,13 @@ from pydantic import BaseModel, Field
 Role = Literal["user", "ai"]
 
 
+class Emotion3D(BaseModel):
+    valence: float = Field(..., ge=-1.0, le=1.0, description="Emotional positivity/negativity (-1.0 to 1.0)")
+    arousal: float = Field(..., ge=0.0, le=1.0, description="Emotional intensity (0.0 to 1.0)")
+    dominance: float = Field(..., ge=0.0, le=1.0, description="Sense of control/power (0.0 to 1.0)")
+    impact: float = Field(..., ge=0.0, le=1.0, description="Message impact/significance (0.0 to 1.0)")
+
+
 class ChatMessage(BaseModel):
     id: str = Field(..., description="Mongo ObjectId as string")
     username: str
@@ -16,6 +23,7 @@ class ChatMessage(BaseModel):
     message: str
     emotion_score: int
     emotion_label: str
+    emotion_3d: Optional[Emotion3D] = None
     timestamp: datetime
 
 
@@ -34,6 +42,7 @@ class WsServerMessage(BaseModel):
     message: str
     emotion_score: int
     emotion_label: str
+    emotion_3d: Optional[Emotion3D] = None
     timestamp: datetime
 
 

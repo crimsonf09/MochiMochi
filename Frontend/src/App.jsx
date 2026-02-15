@@ -51,6 +51,7 @@ function App() {
         text: m.message,
         emotionScore: m.emotion_score,
         emotionLabel: m.emotion_label,
+        emotion3d: m.emotion_3d || null,
         timestamp: m.timestamp,
       })),
     )
@@ -133,6 +134,7 @@ function App() {
             text: data.message,
             emotionScore: data.emotion_score,
             emotionLabel: data.emotion_label,
+            emotion3d: data.emotion_3d || null,
             timestamp: data.timestamp,
           },
         ])
@@ -201,6 +203,7 @@ function App() {
         text,
         emotionScore: affection,
         emotionLabel: stage,
+        emotion3d: null, // Will be updated when message is processed
         timestamp: new Date().toISOString(),
       },
     ])
@@ -278,6 +281,22 @@ function App() {
                         <div className="bubbleMeta">
                           <span className="badge">{m.emotionLabel}</span>
                           <span className="badge">Affection: {m.emotionScore}</span>
+                          {m.emotion3d && (
+                            <div className="emotion3d">
+                              <span className="emotion3dLabel">V: {m.emotion3d.valence.toFixed(2)}</span>
+                              <span className="emotion3dLabel">A: {m.emotion3d.arousal.toFixed(2)}</span>
+                              <span className="emotion3dLabel">D: {m.emotion3d.dominance.toFixed(2)}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {m.role === 'user' && m.emotion3d && (
+                        <div className="bubbleMeta">
+                          <div className="emotion3d">
+                            <span className="emotion3dLabel">V: {m.emotion3d.valence.toFixed(2)}</span>
+                            <span className="emotion3dLabel">A: {m.emotion3d.arousal.toFixed(2)}</span>
+                            <span className="emotion3dLabel">D: {m.emotion3d.dominance.toFixed(2)}</span>
+                          </div>
                         </div>
                       )}
                     </div>
