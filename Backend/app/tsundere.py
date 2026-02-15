@@ -33,9 +33,9 @@ def persona_system_prompt(
         conditions.append("Strong emotional attachment internally. Tone becomes gentler. Add embarrassed or defensive phrasing when closeness is implied. Still avoid direct confession of feelings.")
     
     # Valence Conditions
-    if ai_valence < -0.4:
+    if ai_valence < 0:
         conditions.append("Increase sharpness. Use more reactive or irritated tone. A bit aggressive")
-    elif ai_valence > 0.4:
+    elif ai_valence > 0.7:
         conditions.append("Increase supportive tone. Allow softer wording, filtered through pride.")
     else:
         conditions.append("Maintain balanced, guarded tone.")

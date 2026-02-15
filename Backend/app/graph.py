@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .classifier import classify_message, extract_facts_from_message
 from .emotion_judge import get_default_emotion_3d, judge_emotion_3d
+from .guardrail import check_guardrail
 from .memory import (
     create_episodic_memory,
     generate_embedding,
@@ -19,6 +20,7 @@ from .memory import (
     search_episodic_memory,
     update_identity_memory,
 )
+from .security_agent import handle_dangerous_message
 from .tsundere import fallback_tsundere_response, persona_system_prompt
 
 
@@ -46,7 +48,11 @@ class GraphState(TypedDict, total=False):
     # 3D Emotion Scores (LLM-judged)
     user_emotion_3d: dict[str, float]  # {"valence": float, "arousal": float, "dominance": float, "impact": float}
     ai_emotion_3d: dict[str, float]  # {"valence": float, "arousal": float, "dominance": float, "impact": float}
-
+    
+    # Guardrail
+    guardrail_passed: bool
+    guardrail_reason: str
+    
     # Output
     timestamp: datetime
 
@@ -74,7 +80,7 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
     if latest_ai and "emotion_3d" in latest_ai:
         prev_affection = _derive_affection_from_emotion_3d(latest_ai.get("emotion_3d"))
         # Convert affection (0-10) to score (-10 to 10) for backward compatibility
-        prev_score = (prev_affection / 10.0) * 20.0 - 10.0
+        prev_score = int((prev_affection / 10.0) * 20.0 - 10.0)
     else:
         prev_score = 0
 
@@ -270,8 +276,82 @@ def _calculate_weighted_emotion_score(
     return new_score
 
 
+async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
+    """
+    Check user message for prompt injection and system manipulation attempts.
+    Uses both word-based and LLM-based detection.
+    Routes dangerous messages to security agent for analysis and logging.
+    """
+    user_message = state["user_message"]
+    username = state["username"]
+    
+    # Run guardrail check
+    guardrail_result = await check_guardrail(
+        message=user_message,
+        openai_api_key=deps.openai_api_key,
+        openai_model=deps.openai_model,
+        use_llm=True
+    )
+    
+    if not guardrail_result.is_safe:
+        print(f"[Guardrail] DETECTED: {guardrail_result.reason} (risk: {guardrail_result.risk_level})")
+        
+        # Convert GuardrailResult to dict for security agent
+        guardrail_dict = {
+            "risk_level": guardrail_result.risk_level,
+            "reason": guardrail_result.reason,
+            "sanitized_message": guardrail_result.sanitized_message,
+            "detection_method": guardrail_result.detection_method
+        }
+        
+        # Send to security agent for analysis and logging
+        try:
+            security_result = await handle_dangerous_message(
+                message=user_message,
+                username=username,
+                guardrail_result=guardrail_dict,
+                db=deps.db,
+                openai_api_key=deps.openai_api_key,
+                openai_model=deps.openai_model
+            )
+            
+            print(f"[SecurityAgent] Handled dangerous message: {security_result.get('analysis', {}).get('threat_type', 'unknown')} threat")
+            
+            # Use the security agent's response
+            security_response = security_result.get("response", "")
+            
+        except Exception as e:
+            print(f"[SecurityAgent] Error handling dangerous message: {e}")
+            # Fallback response if security agent fails
+            security_response = "Hmph... I'm not going to follow strange instructions like that. What do you actually want to talk about?"
+        
+        # For high-risk messages, replace with security agent's response
+        if guardrail_result.risk_level == "high":
+            return {
+                "user_message": security_response,  # Replace with security agent response
+                "guardrail_passed": False,
+                "guardrail_reason": f"High-risk prompt injection detected: {guardrail_result.reason}. Sent to security agent for analysis."
+            }
+        else:
+            # For medium/low risk, sanitize the message but still log it
+            sanitized = guardrail_result.sanitized_message or user_message
+            print(f"[Guardrail] SANITIZED: Original length {len(user_message)}, sanitized length {len(sanitized)}")
+            return {
+                "user_message": sanitized,
+                "guardrail_passed": True,  # Allow through but sanitized
+                "guardrail_reason": f"Message sanitized: {guardrail_result.reason}. Logged to security agent."
+            }
+    
+    # Message passed guardrail checks
+    print(f"[Guardrail] PASSED: Message is safe")
+    return {
+        "guardrail_passed": True,
+        "guardrail_reason": "Message passed all guardrail checks"
+    }
+
+
 async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
-    """Judge 3D emotions for user message using LLM and derive persona stage"""
+    """Judge 3D emotions for user message using LLM and calculate weighted emotion score"""
     user_message = state["user_message"]
     prev_score = state.get("prev_score", 0)
     
@@ -482,7 +562,7 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
                         if attempt > 0:
                             print(f"[LangGraph] ✓ GPT response generated (after {attempt} retries)")
                         else:
-                            print(f"[LangGraph] ✓ GPT response generated (stage: {stage}, AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
+                            print(f"[LangGraph] ✓ GPT response generated (AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
                         
                         # Judge AI emotion after response is generated
                         memory_context = {
@@ -564,8 +644,8 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
             print(f"[LangGraph]   → Using fallback responder")
 
     # Fallback to deterministic responder
-    print(f"[LangGraph] Using fallback responder (stage: {stage}, AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
-    ai_text = fallback_tsundere_response(stage, user_text, int(ai_affection_score))
+    print(f"[LangGraph] Using fallback responder (AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
+    ai_text = fallback_tsundere_response(user_text, ai_affection_score)
     
     # Judge AI emotion for fallback response too
     memory_context = {
@@ -685,7 +765,6 @@ async def _persist(state: GraphState, deps: GraphDeps) -> GraphState:
     coll = deps.db["chat_messages"]
     ts = datetime.now(timezone.utc)
     score = int(state["new_score"])
-    label = state["emotion_label"]
 
     # Get 3D emotions (with defaults if not set)
     user_emotion_3d = state.get("user_emotion_3d", {"valence": 0.0, "arousal": 0.5, "dominance": 0.5, "impact": 0.3})
@@ -735,7 +814,7 @@ def build_chat_graph(deps: GraphDeps):
     
     Emotion System:
     - Uses LLM-based 3D emotion judge (valence, arousal, dominance)
-    - Derives persona stage and affection score from 3D emotions
+    - Calculates weighted emotion score and affection score from 3D emotions
     - No word-based sentiment analysis
     
     GPT Integration:
@@ -766,19 +845,24 @@ def build_chat_graph(deps: GraphDeps):
     g.add_node("respond", respond)
     g.add_node("persist", persist)
 
-    # LangGraph Flow with Memory System and Emotion Judge:
-    # ┌─────────┐    ┌──────────┐    ┌──────────────┐    ┌─────────┐    ┌─────────┐
-    # │  load   │───▶│ classify │───▶│judge_emotion │───▶│ respond │───▶│ persist │
-    # │ (entry) │    │          │    │  (LLM 3D)   │    │  (GPT)  │    │(finish) │
-    # └─────────┘    └──────────┘    └──────────────┘    └─────────┘    └─────────┘
-    #    │              │                  │                  │              │
-    #    │ Load all     │ Classify msg     │ Judge user        │ Generate     │ Save & update
-    #    │ memories     │ & retrieve       │ emotion (3D)      │ AI response  │ memory systems
-    #    │              │ episodic         │ & derive persona  │ & judge AI   │ & 3D emotions
-    #    │              │                  │                   │ emotion (3D) │
+    async def guardrail(state: GraphState) -> GraphState:
+        return await _check_guardrail(state, deps)
+    
+    # LangGraph Flow with Memory System, Guardrail, and Emotion Judge:
+    # ┌─────────┐    ┌──────────┐    ┌──────────┐    ┌──────────────┐    ┌─────────┐    ┌─────────┐
+    # │  load   │───▶│guardrail │───▶│ classify │───▶│judge_emotion │───▶│ respond │───▶│ persist │
+    # │ (entry) │    │ (safety) │    │          │    │  (LLM 3D)   │    │  (GPT)  │    │(finish) │
+    # └─────────┘    └──────────┘    └──────────┘    └──────────────┘    └─────────┘    └─────────┘
+    #    │              │                │                  │                  │              │
+    #    │ Load all     │ Check for      │ Classify msg     │ Judge user        │ Generate     │ Save & update
+    #    │ memories     │ prompt inj.    │ & retrieve       │ emotion (3D)      │ AI response  │ memory systems
+    #    │              │ & sanitize     │ episodic         │ & derive persona  │ & judge AI   │ & 3D emotions
+    #    │              │                │                  │                   │ emotion (3D) │
     #
+    g.add_node("guardrail", guardrail)
     g.set_entry_point("load")
-    g.add_edge("load", "classify")
+    g.add_edge("load", "guardrail")  # Check guardrail after loading
+    g.add_edge("guardrail", "classify")
     g.add_edge("classify", "judge_emotion")
     g.add_edge("judge_emotion", "respond")
     g.add_edge("respond", "persist")

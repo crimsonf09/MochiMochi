@@ -17,6 +17,7 @@ from .memory import (
     get_working_memory,
 )
 from .schemas import ChatMessage, ChatState, MemoryData, WsClientMessage, WsServerMessage
+from .security_agent import get_security_events
 from .settings import load_settings
 
 
@@ -155,6 +156,62 @@ async def get_chat_state(username: str):
             score = 0
             affection_score = 5.0
         return {"username": username, "affection_score": int(affection_score), "persona_stage": ""}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/security/events/{username}", response_model=list[dict])
+async def get_user_security_events(username: str, limit: int = 50):
+    """
+    Get security events for a specific user.
+    Useful for monitoring and analysis.
+    """
+    try:
+        db = app.state.db
+        events = await get_security_events(db, username=username, limit=limit)
+        return events
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/security/events", response_model=list[dict])
+async def get_all_security_events(limit: int = 100):
+    """
+    Get all security events (admin endpoint).
+    Useful for monitoring system-wide security threats.
+    """
+    try:
+        db = app.state.db
+        events = await get_security_events(db, username=None, limit=limit)
+        return events
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/security/events/{username}", response_model=list[dict])
+async def get_user_security_events(username: str, limit: int = 50):
+    """
+    Get security events for a specific user.
+    Useful for monitoring and analysis.
+    """
+    try:
+        db = app.state.db
+        events = await get_security_events(db, username=username, limit=limit)
+        return events
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/security/events", response_model=list[dict])
+async def get_all_security_events(limit: int = 100):
+    """
+    Get all security events (admin endpoint).
+    Useful for monitoring system-wide security threats.
+    """
+    try:
+        db = app.state.db
+        events = await get_security_events(db, username=None, limit=limit)
+        return events
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 

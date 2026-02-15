@@ -17,4 +17,9 @@ async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
     # Memory system indexes (imported from memory module)
     from .memory import ensure_memory_indexes
     await ensure_memory_indexes(db)
+    
+    # Security events indexes
+    security_coll = db["security_events"]
+    await security_coll.create_index([("username", 1), ("timestamp", -1)])
+    await security_coll.create_index([("risk_level", 1), ("timestamp", -1)])
 
