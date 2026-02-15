@@ -259,76 +259,62 @@ def _derive_affection_from_emotion_3d(emotion_3d: dict[str, float] | None) -> fl
     return affection_score
 
 
-def _calculate_weighted_emotion_score(
-    prev_score: float,
-    current_score: float,
-    current_impact: float,
-    max_impact_delta: float = 1.5  # Maximum change per message
-) -> tuple[float, float]:
+def _apply_weight_to_emotion_3d(
+    current_emotion_3d: dict[str, float],
+    current_impact: float
+) -> tuple[dict[str, float], float]:
     """
-    Calculate weighted emotion score with maximum impact cap.
-    Adjusted to make it easier to impress the AI.
-    Current weight varies between 0.1 (low impact) and 0.3 (high impact).
+    Apply weight (from LLM-judged impact) to each dimension (V, A, D) of current emotion.
+    Weight is scaled from impact: 0.1 (low impact) to 0.3 (high impact).
+    
+    Flow:
+    1. LLM judges impact (0.0 to 1.0)
+    2. Scale impact to weight: 0.1 + (impact * 0.2) → 0.1 to 0.3
+    3. Multiply each dimension (V, A, D) with weight
+    4. Calculate emotion score from weighted 3D emotion
     
     Args:
-        prev_score: Previous overall emotion score
-        current_score: Current message emotion score
-        current_impact: Impact of current message (0.0 to 1.0)
-        max_impact_delta: Maximum change per message (default 1.5)
+        current_emotion_3d: Current message 3D emotion (V, A, D, impact)
+        current_impact: Impact of current message (0.0 to 1.0) - from LLM judge
     
     Returns:
-        Tuple of (new_score, weighted_score):
-        - new_score: Final score after capping and clamping (-10 to 10)
-        - weighted_score: Weighted score before capping (for display)
+        Tuple of (weighted_emotion_3d, weighted_score):
+        - weighted_emotion_3d: Weighted 3D emotion (V, A, D multiplied by weight)
+        - weighted_score: Emotion score calculated from weighted 3D emotion (for display)
     """
-    # Dynamic weight: 0.1 (low impact) to 0.3 (high impact)
-    # Higher impact messages get more weight
-    current_weight = 0.1 + (current_impact * 0.2)  # Range: 0.1 to 0.3
-    prev_weight = 1.0 - current_weight  # Remaining weight for previous score
+    # Step 1: Scale impact to weight (0.1 to 0.3)
+    weight = 0.1 + (current_impact * 0.2)  # Range: 0.1 to 0.3
+    print(f"[WeightCalc] Step 1 - LLM Impact: {current_impact:.2f} -> Scaled Weight: {weight:.3f} (range: 0.1-0.3)")
     
-    print(f"[WeightCalc] Step 1 - Weights: prev_weight={prev_weight:.3f}, current_weight={current_weight:.3f} (impact={current_impact:.2f})")
-    print(f"[WeightCalc] Step 2 - Input scores: prev_score={prev_score:.2f}, current_score={current_score:.2f}")
+    # Step 2: Get current emotion values
+    curr_v = current_emotion_3d.get("valence", 0.0)
+    curr_a = current_emotion_3d.get("arousal", 0.5)
+    curr_d = current_emotion_3d.get("dominance", 0.5)
+    print(f"[WeightCalc] Step 2 - Current 3D emotion: V={curr_v:.2f}, A={curr_a:.2f}, D={curr_d:.2f}")
     
-    # Boost positive messages more than negative ones
-    if current_score > 0:
-        # Positive messages get a boost - easier to impress
-        impact_multiplier = 1.2  # 20% boost for positive messages
-        scaled_current = current_score * current_impact * impact_multiplier
-        print(f"[WeightCalc] Step 3 - Positive message boost: impact_multiplier={impact_multiplier}, scaled_current={scaled_current:.2f}")
-    else:
-        # Negative messages have normal impact
-        scaled_current = current_score * current_impact
-        print(f"[WeightCalc] Step 3 - Negative message: scaled_current={scaled_current:.2f}")
+    # Step 3: Multiply each dimension with weight
+    weighted_v = curr_v * weight
+    weighted_a = curr_a * weight
+    weighted_d = curr_d * weight
     
-    # Calculate weighted combination (more responsive to current messages)
-    weighted_score = (prev_score * prev_weight) + (scaled_current * current_weight)
-    print(f"[WeightCalc] Step 4 - Weighted calculation: ({prev_score:.2f} * {prev_weight:.3f}) + ({scaled_current:.2f} * {current_weight:.3f}) = {weighted_score:.2f}")
+    print(f"[WeightCalc] Step 3 - Weighted dimensions (multiply with weight):")
+    print(f"  V: {curr_v:.2f} * {weight:.3f} = {weighted_v:.2f}")
+    print(f"  A: {curr_a:.2f} * {weight:.3f} = {weighted_a:.2f}")
+    print(f"  D: {curr_d:.2f} * {weight:.3f} = {weighted_d:.2f}")
     
-    # Calculate raw delta
-    delta = weighted_score - prev_score
-    print(f"[WeightCalc] Step 5 - Raw delta: {weighted_score:.2f} - {prev_score:.2f} = {delta:.2f}")
+    # Create weighted 3D emotion dict
+    weighted_emotion_3d = {
+        "valence": weighted_v,
+        "arousal": weighted_a,
+        "dominance": weighted_d,
+        "impact": current_impact  # Keep original impact
+    }
     
-    # Apply maximum impact cap
-    capped_delta = delta
-    if abs(delta) > max_impact_delta:
-        capped_delta = max_impact_delta if delta > 0 else -max_impact_delta
-        print(f"[WeightCalc] Step 6 - Delta capped: {delta:.2f} -> {capped_delta:.2f} (max={max_impact_delta})")
-    else:
-        print(f"[WeightCalc] Step 6 - Delta within limit: {delta:.2f} (max={max_impact_delta})")
+    # Step 4: Calculate emotion score from weighted 3D emotion
+    weighted_score = _calculate_emotion_score_from_3d(weighted_emotion_3d)
+    print(f"[WeightCalc] Step 4 - Weighted emotion score from 3D: {weighted_score:.2f}")
     
-    # Apply capped delta to previous score
-    new_score = prev_score + capped_delta
-    print(f"[WeightCalc] Step 7 - New score (before clamp): {prev_score:.2f} + {capped_delta:.2f} = {new_score:.2f}")
-    
-    # Clamp to reasonable range (-10 to 10)
-    new_score = max(-10.0, min(10.0, new_score))
-    if new_score != (prev_score + capped_delta):
-        print(f"[WeightCalc] Step 8 - Score clamped: {prev_score + capped_delta:.2f} -> {new_score:.2f}")
-    else:
-        print(f"[WeightCalc] Step 8 - Final score: {new_score:.2f}")
-    
-    # Return both the final score and the weighted score (before capping) for display
-    return new_score, weighted_score
+    return weighted_emotion_3d, weighted_score
 
 
 async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
@@ -445,21 +431,36 @@ async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
             "impact": default.impact
         }
     
-    # Calculate emotion score from 3D emotion
-    current_score = _calculate_emotion_score_from_3d(user_emotion_dict)
+    # Get impact from LLM-judged emotion
     current_impact = user_emotion_dict.get("impact", 0.5)
     
-    # Calculate weighted score with maximum impact cap
-    # Weight is dynamic: 0.1 (low impact) to 0.3 (high impact)
-    new_score, weighted_score = _calculate_weighted_emotion_score(
-        prev_score=float(prev_score),
-        current_score=current_score,
-        current_impact=current_impact,
-        max_impact_delta=1.5  # Maximum change of ±1.5 per message
+    # Apply weight to current emotion 3D (multiply V, A, D with scaled weight)
+    # Flow: LLM judges impact → scale to weight (0.1-0.3) → multiply with V, A, D
+    weighted_emotion_3d, weighted_score = _apply_weight_to_emotion_3d(
+        current_emotion_3d=user_emotion_dict,
+        current_impact=current_impact
     )
     
-    delta = new_score - prev_score
-    print(f"[EmotionJudge] Score: prev={prev_score:.2f}, current={current_score:.2f}, weighted={weighted_score:.2f}, new={new_score:.2f}, delta={delta:.2f} (capped at ±1.5)")
+    # Use weighted score as new score (no previous score combination)
+    new_score = weighted_score
+    
+    # Apply impact cap and clamp
+    prev_score_float = float(prev_score)
+    delta = new_score - prev_score_float
+    if abs(delta) > 1.5:
+        capped_delta = 1.5 if delta > 0 else -1.5
+        new_score = prev_score_float + capped_delta
+        print(f"[WeightCalc] Step 5 - Delta capped: {delta:.2f} -> {capped_delta:.2f} (max=1.5)")
+    
+    # Clamp to reasonable range (-10 to 10)
+    new_score = max(-10.0, min(10.0, new_score))
+    if new_score != weighted_score:
+        print(f"[WeightCalc] Step 6 - Score clamped: {weighted_score:.2f} -> {new_score:.2f}")
+    
+    # Update user_emotion_3d with weighted values
+    user_emotion_dict = weighted_emotion_3d
+    
+    print(f"[EmotionJudge] Summary: prev={prev_score:.2f}, weighted={weighted_score:.2f}, new={new_score:.2f}, delta={delta:.2f} (capped at ±1.5)")
     
     # Calculate user's affection score from their 3D emotion
     user_affection_score = calculate_affection_score_from_3d(user_emotion_dict)

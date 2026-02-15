@@ -61,19 +61,15 @@ def _build_judge_prompt(
 
 1. **Valence** (-1.0 to 1.0): Emotional positivity/negativity
    - -1.0: Very negative (rude, insulting, annoying, using bad words/คำหยาบ, being disruptive)
-   - -0.5: Slightly negative (impatient, slightly rude)
    - 0.0: Neutral
-   - 0.5: Slightly positive (polite, respectful, nice/พูดดี)
    - 1.0: Very positive (very polite, kind, complimentary, speaking nicely/พูดดีมาก)
 
 2. **Arousal** (0.0 to 1.0): Emotional intensity/activation
    - 0.0: Calm, relaxed, passive
-   - 0.5: Moderate energy
    - 1.0: Highly excited, intense, energetic
 
 3. **Dominance** (0.0 to 1.0): Sense of control/power
    - 0.0: Submissive, deferential, seeking approval
-   - 0.5: Balanced, equal
    - 1.0: Dominant, assertive, in control
 
 **Context:**
