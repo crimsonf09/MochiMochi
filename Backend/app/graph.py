@@ -43,6 +43,7 @@ class GraphState(TypedDict, total=False):
     # Derived
     delta: int
     new_score: int
+    weighted_score: float  # Weighted score before capping (for display)
     ai_message: str
     
     # 3D Emotion Scores (LLM-judged)
@@ -204,19 +205,42 @@ def _calculate_emotion_score_from_3d(emotion_3d: dict[str, float] | None) -> flo
     """
     Calculate emotion score from 3D emotion.
     Uses valence as base, scaled by impact.
-    Returns score in range -5.0 to 5.0.
+    Adjusted to make positive messages more impactful (easier to impress).
+    Returns score in range -3.5 to 4.0 (positive messages get more range).
     """
     if not emotion_3d:
+        print(f"[EmotionScore] No emotion_3d provided, returning 0.0")
         return 0.0
     
     valence = emotion_3d.get("valence", 0.0)
     impact = emotion_3d.get("impact", 0.5)
+    arousal = emotion_3d.get("arousal", 0.5)
+    dominance = emotion_3d.get("dominance", 0.5)
     
-    # Base score from valence (-5 to 5)
-    base_score = valence * 5.0
+    print(f"[EmotionScore] Step 1 - Input 3D emotion: V={valence:.2f}, A={arousal:.2f}, D={dominance:.2f}, Impact={impact:.2f}")
     
-    # Scale by impact (high impact = stronger effect)
-    score = base_score * impact
+    # Base score from valence - positive messages get more range (easier to impress)
+    if valence > 0:
+        # Positive messages: scale to 0 to 4.0 (easier to impress)
+        base_score = valence * 4.0
+        print(f"[EmotionScore] Step 2 - Positive valence: {valence:.2f} * 4.0 = {base_score:.2f}")
+    else:
+        # Negative messages: scale to -3.5 to 0 (less impactful)
+        base_score = valence * 3.5
+        print(f"[EmotionScore] Step 2 - Negative valence: {valence:.2f} * 3.5 = {base_score:.2f}")
+    
+    # Scale by impact - positive messages get boost
+    if valence > 0:
+        # Positive messages: impact multiplier 0.8 to 1.2 (boost)
+        impact_multiplier = 0.8 + (impact * 0.4)
+        print(f"[EmotionScore] Step 3 - Positive impact multiplier: 0.8 + ({impact:.2f} * 0.4) = {impact_multiplier:.3f}")
+    else:
+        # Negative messages: impact multiplier 0.7 to 1.0 (normal)
+        impact_multiplier = 0.7 + (impact * 0.3)
+        print(f"[EmotionScore] Step 3 - Negative impact multiplier: 0.7 + ({impact:.2f} * 0.3) = {impact_multiplier:.3f}")
+    
+    score = base_score * impact_multiplier
+    print(f"[EmotionScore] Step 4 - Final emotion score: {base_score:.2f} * {impact_multiplier:.3f} = {score:.2f}")
     
     return score
 
@@ -239,41 +263,72 @@ def _calculate_weighted_emotion_score(
     prev_score: float,
     current_score: float,
     current_impact: float,
-    prev_weight: float = 0.7,
-    current_weight: float = 0.3,
-    max_impact_delta: float = 2.0
-) -> float:
+    max_impact_delta: float = 1.5  # Maximum change per message
+) -> tuple[float, float]:
     """
     Calculate weighted emotion score with maximum impact cap.
+    Adjusted to make it easier to impress the AI.
+    Current weight varies between 0.1 (low impact) and 0.3 (high impact).
     
     Args:
         prev_score: Previous overall emotion score
         current_score: Current message emotion score
         current_impact: Impact of current message (0.0 to 1.0)
-        prev_weight: Weight for previous score (default 0.7)
-        current_weight: Weight for current score (default 0.3)
-        max_impact_delta: Maximum change per message (default 2.0)
+        max_impact_delta: Maximum change per message (default 1.5)
     
     Returns:
-        New weighted emotion score
+        Tuple of (new_score, weighted_score):
+        - new_score: Final score after capping and clamping (-10 to 10)
+        - weighted_score: Weighted score before capping (for display)
     """
-    # Calculate weighted combination
-    weighted_score = (prev_score * prev_weight) + (current_score * current_weight)
+    # Dynamic weight: 0.1 (low impact) to 0.3 (high impact)
+    # Higher impact messages get more weight
+    current_weight = 0.1 + (current_impact * 0.2)  # Range: 0.1 to 0.3
+    prev_weight = 1.0 - current_weight  # Remaining weight for previous score
+    
+    print(f"[WeightCalc] Step 1 - Weights: prev_weight={prev_weight:.3f}, current_weight={current_weight:.3f} (impact={current_impact:.2f})")
+    print(f"[WeightCalc] Step 2 - Input scores: prev_score={prev_score:.2f}, current_score={current_score:.2f}")
+    
+    # Boost positive messages more than negative ones
+    if current_score > 0:
+        # Positive messages get a boost - easier to impress
+        impact_multiplier = 1.2  # 20% boost for positive messages
+        scaled_current = current_score * current_impact * impact_multiplier
+        print(f"[WeightCalc] Step 3 - Positive message boost: impact_multiplier={impact_multiplier}, scaled_current={scaled_current:.2f}")
+    else:
+        # Negative messages have normal impact
+        scaled_current = current_score * current_impact
+        print(f"[WeightCalc] Step 3 - Negative message: scaled_current={scaled_current:.2f}")
+    
+    # Calculate weighted combination (more responsive to current messages)
+    weighted_score = (prev_score * prev_weight) + (scaled_current * current_weight)
+    print(f"[WeightCalc] Step 4 - Weighted calculation: ({prev_score:.2f} * {prev_weight:.3f}) + ({scaled_current:.2f} * {current_weight:.3f}) = {weighted_score:.2f}")
     
     # Calculate raw delta
     delta = weighted_score - prev_score
+    print(f"[WeightCalc] Step 5 - Raw delta: {weighted_score:.2f} - {prev_score:.2f} = {delta:.2f}")
     
     # Apply maximum impact cap
+    capped_delta = delta
     if abs(delta) > max_impact_delta:
-        delta = max_impact_delta if delta > 0 else -max_impact_delta
+        capped_delta = max_impact_delta if delta > 0 else -max_impact_delta
+        print(f"[WeightCalc] Step 6 - Delta capped: {delta:.2f} -> {capped_delta:.2f} (max={max_impact_delta})")
+    else:
+        print(f"[WeightCalc] Step 6 - Delta within limit: {delta:.2f} (max={max_impact_delta})")
     
     # Apply capped delta to previous score
-    new_score = prev_score + delta
+    new_score = prev_score + capped_delta
+    print(f"[WeightCalc] Step 7 - New score (before clamp): {prev_score:.2f} + {capped_delta:.2f} = {new_score:.2f}")
     
     # Clamp to reasonable range (-10 to 10)
     new_score = max(-10.0, min(10.0, new_score))
+    if new_score != (prev_score + capped_delta):
+        print(f"[WeightCalc] Step 8 - Score clamped: {prev_score + capped_delta:.2f} -> {new_score:.2f}")
+    else:
+        print(f"[WeightCalc] Step 8 - Final score: {new_score:.2f}")
     
-    return new_score
+    # Return both the final score and the weighted score (before capping) for display
+    return new_score, weighted_score
 
 
 async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
@@ -395,17 +450,16 @@ async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
     current_impact = user_emotion_dict.get("impact", 0.5)
     
     # Calculate weighted score with maximum impact cap
-    new_score = _calculate_weighted_emotion_score(
+    # Weight is dynamic: 0.1 (low impact) to 0.3 (high impact)
+    new_score, weighted_score = _calculate_weighted_emotion_score(
         prev_score=float(prev_score),
         current_score=current_score,
         current_impact=current_impact,
-        prev_weight=0.7,  # 70% previous score
-        current_weight=0.3,  # 30% current message
-        max_impact_delta=2.0  # Maximum change of ±2.0 per message
+        max_impact_delta=1.5  # Maximum change of ±1.5 per message
     )
     
     delta = new_score - prev_score
-    print(f"[EmotionJudge] Score: prev={prev_score:.2f}, current={current_score:.2f}, new={new_score:.2f}, delta={delta:.2f} (capped at ±2.0)")
+    print(f"[EmotionJudge] Score: prev={prev_score:.2f}, current={current_score:.2f}, weighted={weighted_score:.2f}, new={new_score:.2f}, delta={delta:.2f} (capped at ±1.5)")
     
     # Calculate user's affection score from their 3D emotion
     user_affection_score = calculate_affection_score_from_3d(user_emotion_dict)
@@ -414,6 +468,7 @@ async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
         "user_emotion_3d": user_emotion_dict,
         "delta": delta,
         "new_score": new_score,
+        "weighted_score": weighted_score,  # Store weighted score for display
         "user_affection_score": user_affection_score  # Store user's affection score (0-10)
     }
 
@@ -453,12 +508,14 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
         ai_dominance = 0.5
     
     # Build enhanced system prompt with memory context and emotion scores
+    # Include character profile (Mochi) - works alongside emotion system
     system_parts = [persona_system_prompt(
         ai_affection=ai_affection_score,
         user_affection=user_affection_score,
         ai_valence=ai_valence,
         ai_arousal=ai_arousal,
-        ai_dominance=ai_dominance
+        ai_dominance=ai_dominance,
+        character_name="Mochi"  # Use Mochi character profile
     )]
     
     # Add identity facts

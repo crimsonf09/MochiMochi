@@ -49,6 +49,7 @@ function App() {
         role: m.role,
         text: m.message,
         emotionScore: m.emotion_score,
+        weightedScore: m.weighted_score || null,
         emotionLabel: m.emotion_label || '',  // Deprecated, kept for backward compatibility
         emotion3d: m.emotion_3d || null,
         timestamp: m.timestamp,
@@ -131,6 +132,7 @@ function App() {
             role: 'ai',
             text: data.message,
             emotionScore: data.emotion_score,
+            weightedScore: data.weighted_score || null,
             emotionLabel: data.emotion_label,
             emotion3d: data.emotion_3d || null,
             timestamp: data.timestamp,
@@ -275,6 +277,11 @@ function App() {
                       {m.role === 'ai' && (
                         <div className="bubbleMeta">
                           <span className="badge">Affection: {m.emotionScore}</span>
+                          {m.weightedScore !== null && m.weightedScore !== undefined && (
+                            <span className="badge" style={{opacity: 0.7, fontSize: '0.85em'}}>
+                              Weighted: {m.weightedScore.toFixed(2)}
+                            </span>
+                          )}
                           {m.emotion3d && (
                             <div className="emotion3d">
                               <span className="emotion3dLabel">V: {m.emotion3d.valence.toFixed(2)}</span>

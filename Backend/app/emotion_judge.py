@@ -60,9 +60,11 @@ def _build_judge_prompt(
     prompt = f"""You are an expert emotion judge. Analyze the emotional content of a message on 3 dimensions:
 
 1. **Valence** (-1.0 to 1.0): Emotional positivity/negativity
-   - -1.0: Very negative (sad, angry, disappointed)
+   - -1.0: Very negative (rude, insulting, annoying, using bad words/คำหยาบ, being disruptive)
+   - -0.5: Slightly negative (impatient, slightly rude)
    - 0.0: Neutral
-   - 1.0: Very positive (happy, joyful, pleased)
+   - 0.5: Slightly positive (polite, respectful, nice/พูดดี)
+   - 1.0: Very positive (very polite, kind, complimentary, speaking nicely/พูดดีมาก)
 
 2. **Arousal** (0.0 to 1.0): Emotional intensity/activation
    - 0.0: Calm, relaxed, passive
@@ -140,7 +142,7 @@ async def judge_emotion_3d(
             valence = float(data.get("valence", 0.0))
             arousal = float(data.get("arousal", 0.5))
             dominance = float(data.get("dominance", 0.5))
-            impact = float(data.get("impact", 0.5))
+            impact = float(data.get("impact", 0.3))
             
             # Clamp values to valid ranges
             valence = max(-1.0, min(1.0, valence))

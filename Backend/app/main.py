@@ -60,9 +60,23 @@ load_dotenv()  # supports local env file usage without committing dotfiles
 settings = load_settings()
 
 app = FastAPI(title="Tsundere Chat Backend")
+
+# CORS configuration - support wildcard patterns for Vercel
+cors_origins = settings.cors_origins.copy()
+# FastAPI CORSMiddleware doesn't support wildcards directly, so we need to handle it
+# For now, we'll use allow_origin_regex for Vercel patterns
+allow_origin_regex = None
+if any("vercel.app" in origin or "*" in origin for origin in cors_origins):
+    # Extract non-wildcard origins
+    exact_origins = [o for o in cors_origins if "*" not in o and "vercel.app" not in o]
+    # Add regex pattern for Vercel
+    allow_origin_regex = r"https://.*\.vercel\.app"
+    cors_origins = exact_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=cors_origins if cors_origins else ["*"],  # Fallback to allow all if empty
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -298,6 +312,7 @@ async def ws_chat(websocket: WebSocket, username: str):
             server_msg = WsServerMessage(
                 message=result["ai_message"],
                 emotion_score=int(result["new_score"]),
+                weighted_score=result.get("weighted_score"),  # Include weighted score for display
                 emotion_label="",  # No longer used, kept for backward compatibility
                 emotion_3d=emotion_3d_obj,
                 timestamp=result.get("timestamp") or datetime.utcnow(),

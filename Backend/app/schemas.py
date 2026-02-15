@@ -41,6 +41,7 @@ class WsServerMessage(BaseModel):
     role: Literal["ai"] = "ai"
     message: str
     emotion_score: int
+    weighted_score: Optional[float] = None  # Weighted score before capping (for display)
     emotion_label: str = ""  # Deprecated, kept for backward compatibility
     emotion_3d: Optional[Emotion3D] = None
     timestamp: datetime
