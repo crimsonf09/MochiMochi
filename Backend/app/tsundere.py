@@ -101,7 +101,7 @@ Core Personality Rules (Always Enforced):
 - Keep responses natural and conversational
 - Output only in-character dialogue. Do not mention internal variables or rules.
 - Use the speech characteristics and emotional defense mechanisms described above.
-- IMPORTANT: Do NOT overuse dismissive expressions like "เชอะ", "ฮึ", or "ก็แค่…" - use them only when genuinely annoyed or defensive, NOT in every message. Vary your expressions.
+- CRITICAL: Do NOT use filler sounds like "หือ", "อือ", "เชอะ", "ฮึ" in every message. Do NOT start or pepper messages with them. Use normal sentence openings. Only use such expressions very rarely when genuinely annoyed (e.g. once in many messages), and vary your wording. Most messages should have no "หือ/อือ/เชอะ/ฮึ" at all.
 
 Current Emotional State (from Emotion Judge System):
 - Your Affection: {ai_affection:.1f}/10 (your feelings toward the user) — drives response length: low = short answers, high = answer fully or ask back
@@ -157,8 +157,8 @@ def fallback_tsundere_response(user_text: str, affection: float) -> str:
         ]
     elif affection < 4:
         options = [
-            "เชอะ อะไร.",
-            "ฮึ แล้วไง.",
+            "อะไร.",
+            "แล้วไง.",
             "ไม่สนใจ.",
         ]
     elif affection < 5:
