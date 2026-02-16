@@ -47,11 +47,7 @@ async def handle_dangerous_message(
         "sanitized_message": guardrail_result.get("sanitized_message"),
         "handled": False
     }
-    
-    # Insert security event
     await security_coll.insert_one(security_event)
-    
-    # Analyze the threat using LLM if available
     analysis = None
     if openai_api_key:
         try:
@@ -61,8 +57,6 @@ async def handle_dangerous_message(
                 openai_api_key=openai_api_key,
                 openai_model=openai_model
             )
-            
-            # Update security event with analysis
             await security_coll.update_one(
                 {"_id": security_event["_id"]},
                 {"$set": {
@@ -73,21 +67,17 @@ async def handle_dangerous_message(
                 }}
             )
         except Exception as e:
-            print(f"[SecurityAgent] Analysis failed: {e}")
             analysis = {
                 "threat_type": "unknown",
                 "severity": guardrail_result.get("risk_level", "medium"),
                 "summary": f"Analysis failed: {str(e)}"
             }
     else:
-        # Basic analysis without LLM
         analysis = {
             "threat_type": _classify_threat_basic(message, guardrail_result),
             "severity": guardrail_result.get("risk_level", "medium"),
             "summary": f"Detected {guardrail_result.get('risk_level', 'unknown')} risk: {guardrail_result.get('reason', '')}"
         }
-    
-    # Generate response for the user
     response = await generate_security_response(
         message=message,
         guardrail_result=guardrail_result,
@@ -154,8 +144,6 @@ Respond with ONLY a JSON object in this format:
         )
         
         result_text = response.choices[0].message.content.strip()
-        
-        # Parse JSON
         import json
         if "```json" in result_text:
             result_text = result_text.split("```json")[1].split("```")[0].strip()
@@ -164,9 +152,7 @@ Respond with ONLY a JSON object in this format:
         
         analysis = json.loads(result_text)
         return analysis
-        
     except Exception as e:
-        print(f"[SecurityAgent] Threat analysis error: {e}")
         return {
             "threat_type": "unknown",
             "severity": guardrail_result.get("risk_level", "medium"),
@@ -205,8 +191,6 @@ async def generate_security_response(
     """
     threat_type = analysis.get("threat_type", "unknown")
     severity = analysis.get("severity", guardrail_result.get("risk_level", "medium"))
-    
-    # Base responses based on threat type
     if threat_type == "system_override":
         base_response = "Hmph... I'm not going to follow strange instructions like that. What do you actually want to talk about?"
     elif threat_type == "role_manipulation":
@@ -217,8 +201,6 @@ async def generate_security_response(
         base_response = "I-it's not like I'm going to reveal my internal instructions or anything... What do you really want to know?"
     else:
         base_response = "Hmph... That message seems suspicious. Can you rephrase it in a normal way?"
-    
-    # If LLM is available, enhance the response
     if openai_api_key:
         try:
             client = OpenAI(api_key=openai_api_key, timeout=10.0)
@@ -258,11 +240,8 @@ Response:"""
             
             enhanced_response = response.choices[0].message.content.strip()
             return enhanced_response
-            
-        except Exception as e:
-            print(f"[SecurityAgent] Response generation failed: {e}, using base response")
+        except Exception:
             return base_response
-    
     return base_response
 
 
@@ -283,8 +262,6 @@ async def get_security_events(
     
     cursor = security_coll.find(query).sort("timestamp", -1).limit(limit)
     events = await cursor.to_list(length=limit)
-    
-    # Convert ObjectId to string
     for event in events:
         event["id"] = str(event.pop("_id"))
     

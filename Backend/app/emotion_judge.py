@@ -14,11 +14,12 @@ from openai import OpenAI
 
 @dataclass(frozen=True)
 class Emotion3D:
-    """3-dimensional emotion scores"""
-    valence: float  # -1.0 (negative) to 1.0 (positive)
-    arousal: float  # 0.0 (calm) to 1.0 (excited)
-    dominance: float  # 0.0 (submissive) to 1.0 (dominant)
-    impact: float  # 0.0 (minimal) to 1.0 (highly impactful)
+    """3-dimensional emotion scores + optional affection (for user messages)"""
+    valence: float
+    arousal: float
+    dominance: float
+    impact: float
+    affection: float | None = None
 
 
 def _build_judge_prompt(
@@ -27,8 +28,6 @@ def _build_judge_prompt(
     memory_context: dict[str, Any]
 ) -> str:
     """Build prompt for LLM emotion judge"""
-    
-    # Memory context summary
     memory_parts = []
     
     if memory_context.get("identity_facts"):
@@ -51,7 +50,7 @@ def _build_judge_prompt(
         if working:
             recent_context = "\n".join([
                 f"{m.get('role', 'unknown')}: {m.get('message', '')[:100]}"
-                for m in working[-3:]  # Last 3 turns
+                for m in working[-3:]
             ])
             memory_parts.append(f"Recent conversation:\n{recent_context}")
     
@@ -59,10 +58,11 @@ def _build_judge_prompt(
     
     prompt = f"""You are an expert emotion judge. Analyze the emotional content of a message on 3 dimensions:
 
-1. **Valence** (-1.0 to 1.0): Emotional positivity/negativity
-   - -1.0: Very negative (rude, insulting, annoying, using bad words/คำหยาบ, being disruptive)
+1. **Valence** (-1.0 to 1.0): Emotional positivity/negativity of the message
+   - -1.0: Very negative (rude, insulting, aggressive, complaining, criticising, hostile to the assistant)
    - 0.0: Neutral
-   - 1.0: Very positive (very polite, kind, complimentary, speaking nicely/พูดดีมาก)
+   - 1.0: Very positive (polite, kind, complimentary, speaking nicely/พูดดีมาก)
+   - CRITICAL: Complaining about the assistant, criticising her, or expressing dissatisfaction -> valence MUST be negative (-0.3 to -1.0). Never give positive valence for complaints or criticism.
 
 2. **Arousal** (0.0 to 1.0): Emotional intensity/activation
    - 0.0: Calm, relaxed, passive
@@ -83,7 +83,27 @@ Message: "{message}"
    - 0.0: Minimal impact, routine message
    - 0.5: Moderate impact, notable but not major
    - 1.0: Highly impactful, emotionally significant, memorable
+"""
+    if role == "user":
+        prompt += """
+5. **Affection** (0.0 to 1.0): How much does this message show the user likes, cares about, or is warm toward the assistant?
+   - 0.0: Hostile, complaining, criticising, rude, or not interested in the assistant
+   - 0.5: Neutral or polite without particular warmth
+   - 1.0: Clearly warm, caring, attached, or interested in the assistant
+   - CRITICAL: Complaining about the assistant, criticising her, or expressing dissatisfaction -> affection MUST be low (0.0 to 0.2). Complaints and criticism must NOT get high affection.
 
+**Task:** Return ONLY a JSON object. Include "affection" only when Role is user.
+{{
+  "valence": <float -1.0 to 1.0>,
+  "arousal": <float 0.0 to 1.0>,
+  "dominance": <float 0.0 to 1.0>,
+  "impact": <float 0.0 to 1.0>,
+  "affection": <float 0.0 to 1.0, only for user messages>
+}}
+
+Do not include any explanation, only the JSON object."""
+    else:
+        prompt += """
 **Task:** Return ONLY a JSON object with exact format:
 {{
   "valence": <float between -1.0 and 1.0>,
@@ -129,35 +149,33 @@ async def judge_emotion_3d(
         
         content = response.choices[0].message.content
         if not content:
-            print(f"[EmotionJudge] Empty response from LLM")
             return None
-        
-        # Parse JSON response
         try:
             data = json.loads(content)
             valence = float(data.get("valence", 0.0))
             arousal = float(data.get("arousal", 0.5))
             dominance = float(data.get("dominance", 0.5))
             impact = float(data.get("impact", 0.3))
-            
-            # Clamp values to valid ranges
+            affection = None
+            if role == "user" and "affection" in data:
+                aff = float(data.get("affection", 0.5))
+                affection = max(0.0, min(1.0, aff))
+
             valence = max(-1.0, min(1.0, valence))
             arousal = max(0.0, min(1.0, arousal))
             dominance = max(0.0, min(1.0, dominance))
             impact = max(0.0, min(1.0, impact))
-            
-            return Emotion3D(valence=valence, arousal=arousal, dominance=dominance, impact=impact)
-            
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
-            print(f"[EmotionJudge] Failed to parse LLM response: {e}")
-            print(f"[EmotionJudge] Response was: {content}")
+
+            return Emotion3D(
+                valence=valence, arousal=arousal, dominance=dominance, impact=impact,
+                affection=affection
+            )
+        except (json.JSONDecodeError, ValueError, KeyError):
             return None
-            
-    except Exception as e:
-        print(f"[EmotionJudge] Error calling LLM: {e}")
+    except Exception:
         return None
 
 
 def get_default_emotion_3d() -> Emotion3D:
     """Return default neutral emotion scores"""
-    return Emotion3D(valence=0.0, arousal=0.5, dominance=0.5, impact=0.3)
+    return Emotion3D(valence=0.0, arousal=0.5, dominance=0.5, impact=0.3, affection=None)

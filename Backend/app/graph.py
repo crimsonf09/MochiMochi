@@ -8,7 +8,6 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import StateGraph
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from .classifier import classify_message, extract_facts_from_message
 from .emotion_judge import get_default_emotion_3d, judge_emotion_3d
 from .guardrail import check_guardrail
 from .memory import (
@@ -18,7 +17,8 @@ from .memory import (
     get_semantic_profile,
     get_working_memory,
     search_episodic_memory,
-    update_identity_memory,
+    trim_working_memory_if_needed,
+    update_identity_memory_from_conversation,
 )
 from .security_agent import handle_dangerous_message
 from .tsundere import fallback_tsundere_response, persona_system_prompt
@@ -27,34 +27,21 @@ from .tsundere import fallback_tsundere_response, persona_system_prompt
 class GraphState(TypedDict, total=False):
     username: str
     user_message: str
-
-    # Loaded from DB
-    history: list[dict[str, Any]]  # last 10 messages, ascending
+    history: list[dict[str, Any]]
     prev_score: int
-
-    # Memory System
-    message_type: str  # "fact", "event", "regular"
-    identity_facts: dict[str, Any]  # Retrieved identity memory
-    working_memory: list[dict[str, Any]]  # Short-term context
-    episodic_memories: list[Any]  # Retrieved episodic memories
-    semantic_profile: dict[str, Any]  # Behavior patterns
-    prev_ai_emotion_3d: dict[str, float] | None  # Previous AI message's 3D emotion
-
-    # Derived
+    identity_facts: dict[str, Any]
+    working_memory: list[dict[str, Any]]
+    episodic_memories: list[Any]
+    semantic_profile: dict[str, Any]
+    prev_ai_emotion_3d: dict[str, float] | None
     delta: int
     new_score: int
-    weighted_score: float  # Weighted score before capping (for display)
+    weighted_score: float
     ai_message: str
-    
-    # 3D Emotion Scores (LLM-judged)
-    user_emotion_3d: dict[str, float]  # {"valence": float, "arousal": float, "dominance": float, "impact": float}
-    ai_emotion_3d: dict[str, float]  # {"valence": float, "arousal": float, "dominance": float, "impact": float}
-    
-    # Guardrail
+    user_emotion_3d: dict[str, float]
+    ai_emotion_3d: dict[str, float]
     guardrail_passed: bool
     guardrail_reason: str
-    
-    # Output
     timestamp: datetime
 
 
@@ -69,30 +56,24 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
     """Load all memory systems and conversation state"""
     username = state["username"]
     coll = deps.db["chat_messages"]
-
-    # Working memory: last 6-10 turns
-    working_memory = await get_working_memory(deps.db, username, max_turns=10)
-    
-    # Legacy history (for backward compatibility)
+    working_memory = await trim_working_memory_if_needed(
+        deps.db, username, max_tokens=2000,
+        openai_api_key=deps.openai_api_key, openai_model=deps.openai_model
+    )
+    if not working_memory:
+        working_memory = await get_working_memory(deps.db, username, max_turns=10)
     history = working_memory
-
-    # Current emotion state: derive from latest AI message's 3D emotion, else default
     latest_ai = await coll.find_one({"username": username, "role": "ai"}, sort=[("timestamp", -1)])
-    if latest_ai and "emotion_3d" in latest_ai:
-        prev_affection = _derive_affection_from_emotion_3d(latest_ai.get("emotion_3d"))
-        # Convert affection (0-10) to score (-10 to 10) for backward compatibility
-        prev_score = int((prev_affection / 10.0) * 20.0 - 10.0)
+    if latest_ai is not None and "emotion_score" in latest_ai:
+        prev_score = int(latest_ai.get("emotion_score", 0))
+        prev_score = max(-10, min(10, prev_score))
     else:
         prev_score = 0
-
-    # Load identity memory (all facts)
     identity_facts = await get_identity_memory(deps.db, username)
     identity_dict = {k: v.value for k, v in identity_facts.items()}
-
-    # Load semantic profile
-    semantic_profile = await get_semantic_profile(deps.db, username)
-    
-    # Get previous AI emotion_3d for use in prompt
+    semantic_profile = await get_semantic_profile(
+        deps.db, username, deps.openai_api_key, deps.openai_model
+    )
     prev_ai_emotion_3d = None
     if latest_ai and "emotion_3d" in latest_ai:
         prev_ai_emotion_3d = latest_ai.get("emotion_3d")
@@ -108,15 +89,10 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
 
 
 async def _classify_and_retrieve_memory(state: GraphState, deps: GraphDeps) -> GraphState:
-    """Classify message and retrieve relevant episodic memories"""
+    """Retrieve relevant episodic memories by embedding similarity (no classifier)."""
     username = state["username"]
     user_message = state["user_message"]
-    
-    # Classify message
-    msg_type, metadata = classify_message(user_message)
-    print(f"[Memory] Classified message as: {msg_type}")
-    
-    # Generate embedding for episodic memory search
+
     query_embedding = None
     if deps.openai_api_key:
         try:
@@ -125,10 +101,8 @@ async def _classify_and_retrieve_memory(state: GraphState, deps: GraphDeps) -> G
                 deps.openai_api_key,
                 "text-embedding-3-small"
             )
-        except Exception as e:
-            print(f"[Memory] Failed to generate query embedding: {e}")
-    
-    # Retrieve episodic memories if embedding available
+        except Exception:
+            pass
     episodic_memories = []
     if query_embedding:
         episodic_memories = await search_episodic_memory(
@@ -137,111 +111,49 @@ async def _classify_and_retrieve_memory(state: GraphState, deps: GraphDeps) -> G
             query_embedding,
             top_k=5
         )
-        print(f"[Memory] Retrieved {len(episodic_memories)} relevant episodic memories")
-    else:
-        print(f"[Memory] No embedding available, skipping episodic memory search")
-    
-    # Store episodic memory summaries
     episodic_summaries = [m.event_summary for m in episodic_memories] if episodic_memories else []
-    
-    return {
-        "message_type": msg_type,
-        "episodic_memories": episodic_summaries,
-    }
+    return {"episodic_memories": episodic_summaries}
 
 
 def calculate_affection_score_from_3d(emotion_3d: dict[str, float] | None) -> float:
     """
-    Calculate affection score (0-10) from 3D emotion dimensions.
-    
-    Equation:
-    - Base: Map valence (-1.0 to 1.0) to (0 to 10) linearly
-    - Arousal modulation: Higher arousal amplifies the effect (0.7 to 1.3 multiplier)
-    - Dominance modulation: Lower dominance (more submissive) slightly increases affection (0.9 to 1.1 multiplier)
-    
-    Formula:
-    base = (valence + 1.0) * 5.0  # Maps -1.0 to 1.0 -> 0.0 to 10.0
-    arousal_mult = 0.7 + (arousal * 0.6)  # Maps 0.0 to 1.0 -> 0.7 to 1.3
-    dominance_mult = 1.1 - (dominance * 0.2)  # Maps 0.0 to 1.0 -> 1.1 to 0.9 (inverse)
-    affection_score = base * arousal_mult * dominance_mult
-    
-    Returns:
-        Affection score in range 0.0 to 10.0
+    Affection score (0-10) from 3D emotion. Valence dominates so aggressive (negative valence) => low affection.
+    - Valence: -1..1 -> 0 to 8 (main driver; negative valence pulls score down)
+    - Arousal: 0..1 -> 0 to 1
+    - Dominance: 0..1 -> (1-d) -> 0 to 1 (submissive = slightly higher)
+    Sum 0-10, clamped. All inputs clamped so no wrong results.
     """
     if not emotion_3d:
-        return 5.0  # Neutral default
-    
-    valence = emotion_3d.get("valence", 0.0)
-    arousal = emotion_3d.get("arousal", 0.5)
-    dominance = emotion_3d.get("dominance", 0.5)
-    
-    # Clamp inputs to valid ranges
-    valence = max(-1.0, min(1.0, valence))
-    arousal = max(0.0, min(1.0, arousal))
-    dominance = max(0.0, min(1.0, dominance))
-    
-    # Base score: Map valence from -1.0 to 1.0 -> 0.0 to 10.0
-    base = (valence + 1.0) * 5.0
-    
-    # Arousal modulation: Higher arousal amplifies the effect
-    # Maps arousal 0.0 to 1.0 -> multiplier 0.7 to 1.3
-    arousal_mult = 0.7 + (arousal * 0.6)
-    
-    # Dominance modulation: Lower dominance (more submissive) slightly increases affection
-    # In tsundere context, being more submissive can indicate hidden affection
-    # Maps dominance 0.0 to 1.0 -> multiplier 1.1 to 0.9 (inverse relationship)
-    dominance_mult = 1.1 - (dominance * 0.2)
-    
-    # Calculate final affection score
-    affection_score = base * arousal_mult * dominance_mult
-    
-    # Clamp to 0-10 range
-    affection_score = max(0.0, min(10.0, affection_score))
-    
-    return affection_score
+        return 5.0
+    v = max(-1.0, min(1.0, float(emotion_3d.get("valence", 0.0))))
+    a = max(0.0, min(1.0, float(emotion_3d.get("arousal", 0.5))))
+    d = max(0.0, min(1.0, float(emotion_3d.get("dominance", 0.5))))
+    valence_contrib = (v + 1.0) * 4.0
+    arousal_contrib = a * 1.0
+    dominance_contrib = (1.0 - d) * 1.0
+    return max(0.0, min(10.0, valence_contrib + arousal_contrib + dominance_contrib))
 
 
 def _calculate_emotion_score_from_3d(emotion_3d: dict[str, float] | None) -> float:
     """
-    Calculate emotion score from 3D emotion.
-    Uses valence as base, scaled by impact.
-    Adjusted to make positive messages more impactful (easier to impress).
-    Returns score in range -3.5 to 4.0 (positive messages get more range).
+    Emotion score from 3D: valence as base, scaled by impact. Returns roughly -3.5 to 4.0.
+    All inputs clamped so bad LLM output cannot produce wrong results.
     """
     if not emotion_3d:
-        print(f"[EmotionScore] No emotion_3d provided, returning 0.0")
         return 0.0
-    
-    valence = emotion_3d.get("valence", 0.0)
-    impact = emotion_3d.get("impact", 0.5)
-    arousal = emotion_3d.get("arousal", 0.5)
-    dominance = emotion_3d.get("dominance", 0.5)
-    
-    print(f"[EmotionScore] Step 1 - Input 3D emotion: V={valence:.2f}, A={arousal:.2f}, D={dominance:.2f}, Impact={impact:.2f}")
-    
-    # Base score from valence - positive messages get more range (easier to impress)
+    valence = max(-1.0, min(1.0, float(emotion_3d.get("valence", 0.0))))
+    impact = max(0.0, min(1.0, float(emotion_3d.get("impact", 0.5))))
+    arousal = max(0.0, min(1.0, float(emotion_3d.get("arousal", 0.5))))
+    dominance = max(0.0, min(1.0, float(emotion_3d.get("dominance", 0.5))))
     if valence > 0:
-        # Positive messages: scale to 0 to 4.0 (easier to impress)
         base_score = valence * 4.0
-        print(f"[EmotionScore] Step 2 - Positive valence: {valence:.2f} * 4.0 = {base_score:.2f}")
     else:
-        # Negative messages: scale to -3.5 to 0 (less impactful)
         base_score = valence * 3.5
-        print(f"[EmotionScore] Step 2 - Negative valence: {valence:.2f} * 3.5 = {base_score:.2f}")
-    
-    # Scale by impact - positive messages get boost
     if valence > 0:
-        # Positive messages: impact multiplier 0.8 to 1.2 (boost)
         impact_multiplier = 0.8 + (impact * 0.4)
-        print(f"[EmotionScore] Step 3 - Positive impact multiplier: 0.8 + ({impact:.2f} * 0.4) = {impact_multiplier:.3f}")
     else:
-        # Negative messages: impact multiplier 0.7 to 1.0 (normal)
         impact_multiplier = 0.7 + (impact * 0.3)
-        print(f"[EmotionScore] Step 3 - Negative impact multiplier: 0.7 + ({impact:.2f} * 0.3) = {impact_multiplier:.3f}")
-    
     score = base_score * impact_multiplier
-    print(f"[EmotionScore] Step 4 - Final emotion score: {base_score:.2f} * {impact_multiplier:.3f} = {score:.2f}")
-    
     return score
 
 
@@ -251,9 +163,7 @@ def _derive_affection_from_emotion_3d(emotion_3d: dict[str, float] | None) -> fl
     Uses the new affection_score calculation (0-10) based on all three dimensions.
     """
     if not emotion_3d:
-        return 5.0  # Neutral default
-    
-    # Calculate affection score (0-10) using all three dimensions
+        return 5.0
     affection_score = calculate_affection_score_from_3d(emotion_3d)
     
     return affection_score
@@ -264,56 +174,30 @@ def _apply_weight_to_emotion_3d(
     current_impact: float
 ) -> tuple[dict[str, float], float]:
     """
-    Apply weight (from LLM-judged impact) to each dimension (V, A, D) of current emotion.
-    Weight is scaled from impact: 0.1 (low impact) to 0.3 (high impact).
+    Apply impact to each dimension (V, A, D). Weight and impact are the same value.
+    Impact (0–1) = how much this message matters; we use it directly as the multiplier.
     
     Flow:
     1. LLM judges impact (0.0 to 1.0)
-    2. Scale impact to weight: 0.1 + (impact * 0.2) → 0.1 to 0.3
-    3. Multiply each dimension (V, A, D) with weight
+    2. Use impact as weight (same value), clamped to [0.1, 1.0] so always positive
+    3. Multiply each dimension (V, A, D) with impact
     4. Calculate emotion score from weighted 3D emotion
-    
-    Args:
-        current_emotion_3d: Current message 3D emotion (V, A, D, impact)
-        current_impact: Impact of current message (0.0 to 1.0) - from LLM judge
-    
-    Returns:
-        Tuple of (weighted_emotion_3d, weighted_score):
-        - weighted_emotion_3d: Weighted 3D emotion (V, A, D multiplied by weight)
-        - weighted_score: Emotion score calculated from weighted 3D emotion (for display)
     """
-    # Step 1: Scale impact to weight (0.1 to 0.3)
-    weight = 0.1 + (current_impact * 0.2)  # Range: 0.1 to 0.3
-    print(f"[WeightCalc] Step 1 - LLM Impact: {current_impact:.2f} -> Scaled Weight: {weight:.3f} (range: 0.1-0.3)")
-    
-    # Step 2: Get current emotion values
+    impact_clamped = max(0.0, min(1.0, current_impact))
+    weight = max(0.1, min(1.0, impact_clamped))
     curr_v = current_emotion_3d.get("valence", 0.0)
     curr_a = current_emotion_3d.get("arousal", 0.5)
     curr_d = current_emotion_3d.get("dominance", 0.5)
-    print(f"[WeightCalc] Step 2 - Current 3D emotion: V={curr_v:.2f}, A={curr_a:.2f}, D={curr_d:.2f}")
-    
-    # Step 3: Multiply each dimension with weight
     weighted_v = curr_v * weight
     weighted_a = curr_a * weight
     weighted_d = curr_d * weight
-    
-    print(f"[WeightCalc] Step 3 - Weighted dimensions (multiply with weight):")
-    print(f"  V: {curr_v:.2f} * {weight:.3f} = {weighted_v:.2f}")
-    print(f"  A: {curr_a:.2f} * {weight:.3f} = {weighted_a:.2f}")
-    print(f"  D: {curr_d:.2f} * {weight:.3f} = {weighted_d:.2f}")
-    
-    # Create weighted 3D emotion dict
     weighted_emotion_3d = {
         "valence": weighted_v,
         "arousal": weighted_a,
         "dominance": weighted_d,
-        "impact": current_impact  # Keep original impact
+        "impact": weight
     }
-    
-    # Step 4: Calculate emotion score from weighted 3D emotion
     weighted_score = _calculate_emotion_score_from_3d(weighted_emotion_3d)
-    print(f"[WeightCalc] Step 4 - Weighted emotion score from 3D: {weighted_score:.2f}")
-    
     return weighted_emotion_3d, weighted_score
 
 
@@ -325,27 +209,19 @@ async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
     """
     user_message = state["user_message"]
     username = state["username"]
-    
-    # Run guardrail check
     guardrail_result = await check_guardrail(
         message=user_message,
         openai_api_key=deps.openai_api_key,
         openai_model=deps.openai_model,
         use_llm=True
     )
-    
     if not guardrail_result.is_safe:
-        print(f"[Guardrail] DETECTED: {guardrail_result.reason} (risk: {guardrail_result.risk_level})")
-        
-        # Convert GuardrailResult to dict for security agent
         guardrail_dict = {
             "risk_level": guardrail_result.risk_level,
             "reason": guardrail_result.reason,
             "sanitized_message": guardrail_result.sanitized_message,
             "detection_method": guardrail_result.detection_method
         }
-        
-        # Send to security agent for analysis and logging
         try:
             security_result = await handle_dangerous_message(
                 message=user_message,
@@ -355,18 +231,9 @@ async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
                 openai_api_key=deps.openai_api_key,
                 openai_model=deps.openai_model
             )
-            
-            print(f"[SecurityAgent] Handled dangerous message: {security_result.get('analysis', {}).get('threat_type', 'unknown')} threat")
-            
-            # Use the security agent's response
             security_response = security_result.get("response", "")
-            
-        except Exception as e:
-            print(f"[SecurityAgent] Error handling dangerous message: {e}")
-            # Fallback response if security agent fails
+        except Exception:
             security_response = "Hmph... I'm not going to follow strange instructions like that. What do you actually want to talk about?"
-        
-        # For high-risk messages, replace with security agent's response
         if guardrail_result.risk_level == "high":
             return {
                 "user_message": security_response,  # Replace with security agent response
@@ -374,17 +241,12 @@ async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
                 "guardrail_reason": f"High-risk prompt injection detected: {guardrail_result.reason}. Sent to security agent for analysis."
             }
         else:
-            # For medium/low risk, sanitize the message but still log it
             sanitized = guardrail_result.sanitized_message or user_message
-            print(f"[Guardrail] SANITIZED: Original length {len(user_message)}, sanitized length {len(sanitized)}")
             return {
                 "user_message": sanitized,
-                "guardrail_passed": True,  # Allow through but sanitized
+                "guardrail_passed": True,
                 "guardrail_reason": f"Message sanitized: {guardrail_result.reason}. Logged to security agent."
             }
-    
-    # Message passed guardrail checks
-    print(f"[Guardrail] PASSED: Message is safe")
     return {
         "guardrail_passed": True,
         "guardrail_reason": "Message passed all guardrail checks"
@@ -392,85 +254,60 @@ async def _check_guardrail(state: GraphState, deps: GraphDeps) -> GraphState:
 
 
 async def _judge_emotions(state: GraphState, deps: GraphDeps) -> GraphState:
-    """Judge 3D emotions for user message using LLM and calculate weighted emotion score"""
+    """
+    Affection = previous + (valence * weight*2). No word lists.
+    valence from LLM (-1 to 1), weight = impact (0 to 1), prev_score (-10 to 10).
+    """
     user_message = state["user_message"]
-    prev_score = state.get("prev_score", 0)
-    
-    # Build memory context for emotion judge
+    prev_score_float = float(state.get("prev_score", 0))
+    max_step = 2.0  # max change per message when valence=±1 and impact=1
+
     memory_context = {
         "identity_facts": state.get("identity_facts", {}),
         "episodic_memories": state.get("episodic_memories", []),
         "semantic_profile": state.get("semantic_profile", {}),
         "working_memory": state.get("working_memory", []),
     }
-    
-    # Judge user emotion
+
     user_emotion = await judge_emotion_3d(
         message=user_message,
         role="user",
         memory_context=memory_context,
         openai_api_key=deps.openai_api_key,
-        openai_model=deps.openai_model
+        openai_model=deps.openai_model,
     )
-    
+
     if user_emotion:
-        print(f"[EmotionJudge] User emotion: V={user_emotion.valence:.2f}, A={user_emotion.arousal:.2f}, D={user_emotion.dominance:.2f}, Impact={user_emotion.impact:.2f}")
+        valence = max(-1.0, min(1.0, user_emotion.valence))
+        weight = max(0.0, min(1.0, user_emotion.impact))
         user_emotion_dict = {
             "valence": user_emotion.valence,
             "arousal": user_emotion.arousal,
             "dominance": user_emotion.dominance,
-            "impact": user_emotion.impact
+            "impact": user_emotion.impact,
         }
     else:
-        print(f"[EmotionJudge] Using default emotion for user (LLM unavailable)")
+        valence = 0.0
+        weight = 0.5
         default = get_default_emotion_3d()
         user_emotion_dict = {
             "valence": default.valence,
             "arousal": default.arousal,
             "dominance": default.dominance,
-            "impact": default.impact
+            "impact": default.impact,
         }
-    
-    # Get impact from LLM-judged emotion
-    current_impact = user_emotion_dict.get("impact", 0.5)
-    
-    # Apply weight to current emotion 3D (multiply V, A, D with scaled weight)
-    # Flow: LLM judges impact → scale to weight (0.1-0.3) → multiply with V, A, D
-    weighted_emotion_3d, weighted_score = _apply_weight_to_emotion_3d(
-        current_emotion_3d=user_emotion_dict,
-        current_impact=current_impact
-    )
-    
-    # Use weighted score as new score (no previous score combination)
-    new_score = weighted_score
-    
-    # Apply impact cap and clamp
-    prev_score_float = float(prev_score)
-    delta = new_score - prev_score_float
-    if abs(delta) > 1.5:
-        capped_delta = 1.5 if delta > 0 else -1.5
-        new_score = prev_score_float + capped_delta
-        print(f"[WeightCalc] Step 5 - Delta capped: {delta:.2f} -> {capped_delta:.2f} (max=1.5)")
-    
-    # Clamp to reasonable range (-10 to 10)
+    delta = valence * weight * max_step
+    new_score = prev_score_float + delta
     new_score = max(-10.0, min(10.0, new_score))
-    if new_score != weighted_score:
-        print(f"[WeightCalc] Step 6 - Score clamped: {weighted_score:.2f} -> {new_score:.2f}")
-    
-    # Update user_emotion_3d with weighted values
-    user_emotion_dict = weighted_emotion_3d
-    
-    print(f"[EmotionJudge] Summary: prev={prev_score:.2f}, weighted={weighted_score:.2f}, new={new_score:.2f}, delta={delta:.2f} (capped at ±1.5)")
-    
-    # Calculate user's affection score from their 3D emotion
-    user_affection_score = calculate_affection_score_from_3d(user_emotion_dict)
-    
+    user_affection_score = (new_score + 10.0) / 2.0
+    delta_actual = new_score - prev_score_float
+
     return {
         "user_emotion_3d": user_emotion_dict,
-        "delta": delta,
+        "delta": delta_actual,
         "new_score": new_score,
-        "weighted_score": weighted_score,  # Store weighted score for display
-        "user_affection_score": user_affection_score  # Store user's affection score (0-10)
+        "weighted_score": new_score,
+        "user_affection_score": user_affection_score,
     }
 
 
@@ -480,46 +317,29 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
     Includes: system prompt, identity facts, episodic memories, semantic profile,
     working memory, and current user message.
     """
-    # Calculate affection score (0-10) from weighted emotion score
-    # Use the new weighted score to derive affection
     new_score = state.get("new_score", 0)
     user_emotion_3d = state.get("user_emotion_3d", {})
-    
-    # Calculate AI's affection score from weighted score (convert to 0-10 range)
-    # The new_score is in range -10 to 10, map to 0-10
     ai_affection_score = max(0.0, min(10.0, (new_score + 10.0) / 2.0))
-    
-    # Calculate user's affection score from their 3D emotion
-    user_affection_score = calculate_affection_score_from_3d(user_emotion_3d)
-    
-    # Get AI's current 3D emotion from previous AI message
-    # Use prev_ai_emotion_3d from state (loaded from latest AI message)
+    user_affection_score = state.get("user_affection_score")
+    if user_affection_score is None:
+        user_affection_score = calculate_affection_score_from_3d(user_emotion_3d)
     prev_ai_emotion_3d = state.get("prev_ai_emotion_3d", {})
-    
     if prev_ai_emotion_3d:
         ai_valence = prev_ai_emotion_3d.get("valence", 0.0)
         ai_arousal = prev_ai_emotion_3d.get("arousal", 0.5)
         ai_dominance = prev_ai_emotion_3d.get("dominance", 0.5)
     else:
-        # Derive from weighted affection score if no previous emotion available
-        # Map affection (0-10) to valence (-1 to 1)
-        ai_valence = (ai_affection_score / 10.0) * 2.0 - 1.0  # Maps 0->-1, 5->0, 10->1
-        # Use moderate arousal and dominance as defaults
+        ai_valence = (ai_affection_score / 10.0) * 2.0 - 1.0
         ai_arousal = 0.5
         ai_dominance = 0.5
-    
-    # Build enhanced system prompt with memory context and emotion scores
-    # Include character profile (Mochi) - works alongside emotion system
     system_parts = [persona_system_prompt(
         ai_affection=ai_affection_score,
         user_affection=user_affection_score,
         ai_valence=ai_valence,
         ai_arousal=ai_arousal,
         ai_dominance=ai_dominance,
-        character_name="Mochi"  # Use Mochi character profile
+        character_name="Mochi"
     )]
-    
-    # Add identity facts
     identity_facts = state.get("identity_facts", {})
     if identity_facts:
         facts_text = "Known facts about the user:\n"
@@ -534,27 +354,20 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
         for i, memory in enumerate(episodic_memories[:3], 1):  # Top 3
             memories_text += f"{i}. {memory}\n"
         system_parts.append(memories_text.strip())
-    
-    # Add semantic profile
     semantic_profile = state.get("semantic_profile", {})
     if semantic_profile:
         profile_text = f"User behavior patterns: {semantic_profile.get('personality_summary', '')}"
         system_parts.append(profile_text)
     
-    # Combine system prompt
     full_system_prompt = "\n\n".join(system_parts)
     
     msgs: list[dict[str, str]] = [
         {"role": "system", "content": full_system_prompt}
     ]
-    
-    # Add working memory (last 6-10 turns)
     working_memory = state.get("working_memory", state.get("history", []))
-    for m in working_memory[-6:]:  # Last 6 turns
+    for m in working_memory[-6:]:
         role = "assistant" if m.get("role") == "ai" else "user"
         msgs.append({"role": role, "content": m.get("message", "")})
-    
-    # Add current user message
     msgs.append({"role": "user", "content": state["user_message"]})
     
     return msgs
@@ -568,44 +381,27 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
     """
     new_score = state.get("new_score", 0)
     user_emotion_3d = state.get("user_emotion_3d", {})
-    
-    # Calculate affection scores (0-10) from weighted scores
     ai_affection_score = max(0.0, min(10.0, (new_score + 10.0) / 2.0))
-    
-    # Get user's affection score from state (calculated in _judge_emotions) or calculate it
     user_affection_score = state.get("user_affection_score")
     if user_affection_score is None:
         user_affection_score = calculate_affection_score_from_3d(user_emotion_3d)
     
     user_text = state["user_message"]
-
-    # Try GPT first if API key is configured
     if deps.openai_api_key:
         try:
             from openai import OpenAI
             from openai import APIError, AuthenticationError, RateLimitError
 
-            # Create OpenAI client with timeout
             client = OpenAI(
                 api_key=deps.openai_api_key,
-                timeout=30.0,  # 30 second timeout
-                max_retries=3,  # Built-in retry support
+                timeout=30.0,
+                max_retries=3,
             )
-            
-            # Prepare messages for GPT (includes system prompt, history, and current message)
             messages = _messages_for_llm(state)
-            
-            # Validate API key format
-            if not deps.openai_api_key.startswith("sk-"):
-                print(f"[LangGraph] WARNING: API key format looks invalid (should start with 'sk-')")
-            
-            # Retry logic with exponential backoff for rate limits
             max_retries = 3
-            base_delay = 2  # Start with 2 seconds
-            
+            base_delay = 2
             for attempt in range(max_retries):
                 try:
-                    # Call GPT through OpenAI API
                     completion = client.chat.completions.create(
                         model=deps.openai_model,
                         messages=messages,
@@ -637,9 +433,7 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
                             openai_api_key=deps.openai_api_key,
                             openai_model=deps.openai_model
                         )
-                        
                         if ai_emotion:
-                            print(f"[EmotionJudge] AI emotion: V={ai_emotion.valence:.2f}, A={ai_emotion.arousal:.2f}, D={ai_emotion.dominance:.2f}, Impact={ai_emotion.impact:.2f}")
                             ai_emotion_dict = {
                                 "valence": ai_emotion.valence,
                                 "arousal": ai_emotion.arousal,
@@ -647,7 +441,6 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
                                 "impact": ai_emotion.impact
                             }
                         else:
-                            print(f"[EmotionJudge] Using default emotion for AI (LLM unavailable)")
                             default = get_default_emotion_3d()
                             ai_emotion_dict = {
                                 "valence": default.valence,
@@ -661,51 +454,16 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
                             "ai_emotion_3d": ai_emotion_dict
                         }
                     else:
-                        print(f"[LangGraph] ⚠ GPT returned empty response, using fallback")
                         break
-                        
-                except RateLimitError as e:
+                except RateLimitError:
                     if attempt < max_retries - 1:
-                        # Calculate wait time: exponential backoff (2s, 4s, 8s)
                         wait_time = base_delay * (2 ** attempt)
-                        print(f"[LangGraph] ⚠ Rate limit hit (attempt {attempt + 1}/{max_retries})")
-                        print(f"[LangGraph]   → Waiting {wait_time} seconds before retry...")
                         await asyncio.sleep(wait_time)
                         continue
-                    else:
-                        # Final attempt failed
-                        print(f"[LangGraph] ✗ GPT Rate Limit Error (after {max_retries} attempts): {e}")
-                        print(f"[LangGraph]   → Rate limit exceeded. Please wait a few minutes.")
-                        print(f"[LangGraph]   → Check your usage: https://platform.openai.com/usage")
-                        print(f"[LangGraph]   → Using fallback responder")
-                        break
-                        
-        except AuthenticationError as e:
-            # Invalid API key
-            print(f"[LangGraph] ✗ GPT Authentication Error: {e}")
-            print(f"[LangGraph]   → Check your OPENAI_API_KEY in .env file")
-            print(f"[LangGraph]   → Using fallback responder")
-        except APIError as e:
-            # Other API errors
-            print(f"[LangGraph] ✗ GPT API Error: {e}")
-            print(f"[LangGraph]   → Error type: {type(e).__name__}")
-            print(f"[LangGraph]   → Using fallback responder")
-        except Exception as e:
-            # Other errors (network, timeout, etc.)
-            error_type = type(e).__name__
-            error_msg = str(e)
-            print(f"[LangGraph] ✗ GPT Error ({error_type}): {error_msg}")
-            print(f"[LangGraph]   → Possible causes:")
-            print(f"[LangGraph]     - Network connection issue")
-            print(f"[LangGraph]     - Invalid model name: {deps.openai_model}")
-            print(f"[LangGraph]     - API key not set correctly")
-            print(f"[LangGraph]   → Using fallback responder")
-
-    # Fallback to deterministic responder
-    print(f"[LangGraph] Using fallback responder (AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
+                    break
+        except (AuthenticationError, APIError, Exception):
+            pass
     ai_text = fallback_tsundere_response(user_text, ai_affection_score)
-    
-    # Judge AI emotion for fallback response too
     memory_context = {
         "identity_facts": state.get("identity_facts", {}),
         "episodic_memories": state.get("episodic_memories", []),
@@ -744,42 +502,11 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
 
 
 async def _update_memory_systems(state: GraphState, deps: GraphDeps) -> GraphState:
-    """Update all memory systems based on message classification"""
+    """Update episodic memory and semantic profile. Identity facts are handled every 5 turns via LLM."""
     username = state["username"]
     user_message = state["user_message"]
-    msg_type = state.get("message_type", "regular")
-    
-    # Update identity memory if facts detected
-    if msg_type == "fact":
-        facts = extract_facts_from_message(user_message)
-        if facts:
-            print(f"[Memory] Detected facts: {list(facts.keys())}")
-            await update_identity_memory(
-                deps.db,
-                username,
-                facts,
-                source_message=user_message
-            )
-            print(f"[Memory] Updated identity memory with {len(facts)} facts")
-    
-    # Create episodic memory for events OR regular messages (with different importance)
-    should_create_episodic = False
-    importance = 0.3  # Default for regular messages
-    
-    if msg_type == "event":
-        importance = 0.7  # Higher importance for significant events
-        should_create_episodic = True
-        print(f"[Memory] Detected significant event, creating episodic memory (importance: {importance})")
-    elif msg_type == "regular":
-        # Create episodic memory for regular messages too, but with lower importance
-        # This ensures we have memories to work with even if classification is strict
-        # Only create if message is substantial (more than 10 chars)
-        if len(user_message.strip()) > 10:
-            should_create_episodic = True
-            print(f"[Memory] Creating episodic memory for regular message (importance: {importance})")
-    
-    if should_create_episodic:
-        # Generate embedding for the memory
+    if len(user_message.strip()) > 10:
+        importance = 0.4
         event_embedding = None
         if deps.openai_api_key:
             try:
@@ -788,32 +515,24 @@ async def _update_memory_systems(state: GraphState, deps: GraphDeps) -> GraphSta
                     deps.openai_api_key,
                     "text-embedding-3-small"
                 )
-            except Exception as e:
-                print(f"[Memory] Failed to generate embedding: {e}")
-        
-        # Extract event summary
-        summary = user_message[:200]  # First 200 chars as summary
-        
+            except Exception:
+                pass
+        summary = user_message[:200]
         await create_episodic_memory(
             deps.db,
             username,
             summary,
             importance,
             event_embedding,
-            metadata={"emotion_score": state.get("new_score", 0), "message_type": msg_type}
+            metadata={"emotion_score": state.get("new_score", 0)}
         )
-        print(f"[Memory] Created episodic memory: {summary[:50]}...")
-        
-        # Regenerate semantic profile periodically (every 5 new memories)
-        # Check how many episodic memories exist
         episodic_coll = deps.db["episodic_memory"]
         memory_count = await episodic_coll.count_documents({"username": username})
-        
-        if memory_count % 5 == 0:  # Every 5th memory
-            print(f"[Memory] Regenerating semantic profile (total memories: {memory_count})")
+        if memory_count % 5 == 0:
             from .memory import generate_semantic_profile
-            await generate_semantic_profile(deps.db, username)
-    
+            await generate_semantic_profile(
+                deps.db, username, deps.openai_api_key, deps.openai_model
+            )
     return {}
 
 
@@ -823,12 +542,8 @@ async def _persist(state: GraphState, deps: GraphDeps) -> GraphState:
     coll = deps.db["chat_messages"]
     ts = datetime.now(timezone.utc)
     score = int(state["new_score"])
-
-    # Get 3D emotions (with defaults if not set)
     user_emotion_3d = state.get("user_emotion_3d", {"valence": 0.0, "arousal": 0.5, "dominance": 0.5, "impact": 0.3})
     ai_emotion_3d = state.get("ai_emotion_3d", {"valence": 0.0, "arousal": 0.5, "dominance": 0.5, "impact": 0.3})
-
-    # Store user message
     prev_score = int(state.get("prev_score", 0))
     await coll.insert_one(
         {
@@ -840,8 +555,6 @@ async def _persist(state: GraphState, deps: GraphDeps) -> GraphState:
             "timestamp": ts,
         }
     )
-    
-    # Store AI message
     await coll.insert_one(
         {
             "username": username,
@@ -852,8 +565,11 @@ async def _persist(state: GraphState, deps: GraphDeps) -> GraphState:
             "timestamp": ts,
         }
     )
-    
-    # Update memory systems
+    message_count = await coll.count_documents({"username": username})
+    if message_count >= 5 and message_count % 5 == 0 and deps.openai_api_key:
+        await update_identity_memory_from_conversation(
+            deps.db, username, deps.openai_api_key, deps.openai_model, last_n_turns=10
+        )
     await _update_memory_systems(state, deps)
 
     return {"timestamp": ts}
@@ -905,21 +621,9 @@ def build_chat_graph(deps: GraphDeps):
 
     async def guardrail(state: GraphState) -> GraphState:
         return await _check_guardrail(state, deps)
-    
-    # LangGraph Flow with Memory System, Guardrail, and Emotion Judge:
-    # ┌─────────┐    ┌──────────┐    ┌──────────┐    ┌──────────────┐    ┌─────────┐    ┌─────────┐
-    # │  load   │───▶│guardrail │───▶│ classify │───▶│judge_emotion │───▶│ respond │───▶│ persist │
-    # │ (entry) │    │ (safety) │    │          │    │  (LLM 3D)   │    │  (GPT)  │    │(finish) │
-    # └─────────┘    └──────────┘    └──────────┘    └──────────────┘    └─────────┘    └─────────┘
-    #    │              │                │                  │                  │              │
-    #    │ Load all     │ Check for      │ Classify msg     │ Judge user        │ Generate     │ Save & update
-    #    │ memories     │ prompt inj.    │ & retrieve       │ emotion (3D)      │ AI response  │ memory systems
-    #    │              │ & sanitize     │ episodic         │ & derive persona  │ & judge AI   │ & 3D emotions
-    #    │              │                │                  │                   │ emotion (3D) │
-    #
     g.add_node("guardrail", guardrail)
     g.set_entry_point("load")
-    g.add_edge("load", "guardrail")  # Check guardrail after loading
+    g.add_edge("load", "guardrail")
     g.add_edge("guardrail", "classify")
     g.add_edge("classify", "judge_emotion")
     g.add_edge("judge_emotion", "respond")

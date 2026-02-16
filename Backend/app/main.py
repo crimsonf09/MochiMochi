@@ -37,17 +37,14 @@ def _serialize_doc(doc: dict[str, Any]) -> dict[str, Any]:
         "emotion_label": doc.get("emotion_label", ""),
         "timestamp": doc.get("timestamp"),
     }
-    # Include 3D emotion if present, ensuring all required fields exist
     emotion_3d = doc.get("emotion_3d")
     if emotion_3d:
-        # Ensure all required fields exist (handle old records without impact)
         emotion_3d_dict = {
             "valence": emotion_3d.get("valence", 0.0),
             "arousal": emotion_3d.get("arousal", 0.5),
             "dominance": emotion_3d.get("dominance", 0.5),
-            "impact": emotion_3d.get("impact", 0.3)  # Default impact for old records
+            "impact": emotion_3d.get("impact", 0.3)
         }
-        # Validate ranges
         emotion_3d_dict["valence"] = max(-1.0, min(1.0, emotion_3d_dict["valence"]))
         emotion_3d_dict["arousal"] = max(0.0, min(1.0, emotion_3d_dict["arousal"]))
         emotion_3d_dict["dominance"] = max(0.0, min(1.0, emotion_3d_dict["dominance"]))
@@ -61,21 +58,15 @@ settings = load_settings()
 
 app = FastAPI(title="Tsundere Chat Backend")
 
-# CORS configuration - support wildcard patterns for Vercel
 cors_origins = settings.cors_origins.copy()
-# FastAPI CORSMiddleware doesn't support wildcards directly, so we need to handle it
-# For now, we'll use allow_origin_regex for Vercel patterns
-allow_origin_regex = None
-if any("vercel.app" in origin or "*" in origin for origin in cors_origins):
-    # Extract non-wildcard origins
-    exact_origins = [o for o in cors_origins if "*" not in o and "vercel.app" not in o]
-    # Add regex pattern for Vercel
-    allow_origin_regex = r"https://.*\.vercel\.app"
-    cors_origins = exact_origins
+allow_origin_regex = r"https://.*\.vercel\.app"
+exact_origins = [o for o in cors_origins if "*" not in o and "vercel.app" not in o]
+vercel_urls = [o for o in cors_origins if "vercel.app" in o and "*" not in o]
+exact_origins.extend(vercel_urls)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins if cors_origins else ["*"],  # Fallback to allow all if empty
+    allow_origins=exact_origins if exact_origins else ["*"],
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
@@ -87,7 +78,6 @@ app.add_middleware(
 async def _startup() -> None:
     try:
         client = AsyncIOMotorClient(settings.mongo_uri)
-        # Test connection
         await client.admin.command("ping")
         db = get_db(client, settings.mongo_db)
         await ensure_indexes(db)
@@ -97,25 +87,7 @@ async def _startup() -> None:
         app.state.graph = build_chat_graph(
             GraphDeps(db=db, openai_api_key=settings.openai_api_key, openai_model=settings.openai_model)
         )
-        
-        # Show GPT status and validate
-        gpt_status = "ENABLED" if settings.openai_api_key else "DISABLED (using fallback)"
-        print(f"[OK] Backend started: MongoDB connected, CORS origins: {settings.cors_origins}")
-        print(f"[OK] GPT Integration: {gpt_status}")
-        if settings.openai_api_key:
-            # Validate API key format
-            if not settings.openai_api_key.startswith("sk-"):
-                print(f"[WARNING] API key format looks invalid (should start with 'sk-')")
-            else:
-                print(f"[OK] GPT API Key: {settings.openai_api_key[:7]}...{settings.openai_api_key[-4:]}")
-            print(f"[OK] GPT Model: {settings.openai_model}")
-            print(f"[INFO] GPT will be called from LangGraph 'respond' node")
-        else:
-            print(f"[INFO] Set OPENAI_API_KEY in .env to enable GPT responses via LangGraph")
-    except Exception as e:
-        print(f"[ERROR] Startup error: {e}")
-        print(f"  MongoDB URI: {settings.mongo_uri}")
-        print(f"  Make sure MongoDB is running!")
+    except Exception:
         raise
 
 
@@ -143,61 +115,29 @@ async def get_chat_history(username: str):
         for doc in docs:
             try:
                 serialized.append(_serialize_doc(doc))
-            except Exception as e:
-                print(f"[API] Error serializing message {doc.get('_id')}: {e}")
-                # Skip invalid messages or provide fallback
+            except Exception:
                 continue
         return serialized
     except Exception as e:
-        print(f"[API] Error in get_chat_history: {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/chat/state/{username}", response_model=ChatState)
 async def get_chat_state(username: str):
+    """Return current user state. emotion_score is in [-10, 10] (from latest AI message)."""
     try:
         db = app.state.db
         coll = db["chat_messages"]
         latest_ai = await coll.find_one({"username": username, "role": "ai"}, sort=[("timestamp", -1)])
-        if latest_ai and "emotion_3d" in latest_ai:
+        if latest_ai and "emotion_score" in latest_ai:
+            emotion_score = max(-10, min(10, int(latest_ai.get("emotion_score", 0))))
+        elif latest_ai and "emotion_3d" in latest_ai:
             from .graph import _derive_affection_from_emotion_3d
-            affection_score = _derive_affection_from_emotion_3d(latest_ai.get("emotion_3d"))
-            # Convert affection (0-10) to score (-10 to 10) for backward compatibility
-            score = int((affection_score / 10.0) * 20.0 - 10.0)
+            aff = _derive_affection_from_emotion_3d(latest_ai.get("emotion_3d"))
+            emotion_score = max(-10, min(10, int(round(aff * 2 - 10))))
         else:
-            score = 0
-            affection_score = 5.0
-        return {"username": username, "affection_score": int(affection_score), "persona_stage": ""}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-
-@app.get("/security/events/{username}", response_model=list[dict])
-async def get_user_security_events(username: str, limit: int = 50):
-    """
-    Get security events for a specific user.
-    Useful for monitoring and analysis.
-    """
-    try:
-        db = app.state.db
-        events = await get_security_events(db, username=username, limit=limit)
-        return events
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-
-@app.get("/security/events", response_model=list[dict])
-async def get_all_security_events(limit: int = 100):
-    """
-    Get all security events (admin endpoint).
-    Useful for monitoring system-wide security threats.
-    """
-    try:
-        db = app.state.db
-        events = await get_security_events(db, username=None, limit=limit)
-        return events
+            emotion_score = 0
+        return {"username": username, "emotion_score": emotion_score, "persona_stage": ""}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
@@ -235,15 +175,11 @@ async def get_chat_memory(username: str):
     """Get all memory data for a user"""
     try:
         db = app.state.db
-        
-        # Get identity facts
         identity_facts_dict = await get_identity_memory(db, username)
         identity_facts = [
             {"key": k, "value": v.value, "confidence": v.confidence}
             for k, v in identity_facts_dict.items()
         ]
-        
-        # Get episodic memories (top 20 by importance)
         episodic_coll = db["episodic_memory"]
         episodic_cursor = (
             episodic_coll.find({"username": username})
@@ -260,13 +196,10 @@ async def get_chat_memory(username: str):
             }
             for doc in episodic_docs
         ]
-        
-        # Get semantic profile
-        semantic_profile = await get_semantic_profile(db, username)
-        
-        # Get working memory count
+        semantic_profile = await get_semantic_profile(
+            db, username, settings.openai_api_key, settings.openai_model
+        )
         working_memory = await get_working_memory(db, username, max_turns=10)
-        
         result = {
             "identity_facts": identity_facts,
             "episodic_memories": episodic_memories,
@@ -277,12 +210,8 @@ async def get_chat_memory(username: str):
             },
             "working_memory_count": len(working_memory),
         }
-        
-        print(f"[API] Memory request for {username}: {len(identity_facts)} facts, {len(episodic_memories)} episodic, {len(working_memory)} working")
-        
         return result
     except Exception as e:
-        print(f"[API] Memory retrieval error for {username}: {e}")
         raise HTTPException(status_code=500, detail=f"Memory retrieval error: {str(e)}")
 
 
@@ -301,19 +230,17 @@ async def ws_chat(websocket: WebSocket, username: str):
                 continue
 
             result = await graph.ainvoke({"username": username, "user_message": client_msg.message})
-            
-            # Get 3D emotions from result
             ai_emotion_3d = result.get("ai_emotion_3d")
             from .schemas import Emotion3D
             emotion_3d_obj = None
             if ai_emotion_3d:
                 emotion_3d_obj = Emotion3D(**ai_emotion_3d)
-            
+            new_score = result.get("new_score", 0)
+            raw_score = max(-10, min(10, int(round(float(new_score)))))
             server_msg = WsServerMessage(
                 message=result["ai_message"],
-                emotion_score=int(result["new_score"]),
-                weighted_score=result.get("weighted_score"),  # Include weighted score for display
-                emotion_label="",  # No longer used, kept for backward compatibility
+                emotion_score=raw_score,
+                weighted_score=float(raw_score),
                 emotion_3d=emotion_3d_obj,
                 timestamp=result.get("timestamp") or datetime.utcnow(),
             )

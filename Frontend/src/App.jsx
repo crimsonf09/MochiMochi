@@ -43,19 +43,21 @@ function App() {
         }
       })
     ])
+    // emotion_score from API is [-10, 10] everywhere
     setMessages(
       h.map((m) => ({
         id: m.id,
         role: m.role,
         text: m.message,
-        emotionScore: m.emotion_score,
+        emotionScore: m.emotion_score != null ? Number(m.emotion_score) : 0,
         weightedScore: m.weighted_score || null,
         emotionLabel: m.emotion_label || '',  // Deprecated, kept for backward compatibility
         emotion3d: m.emotion_3d || null,
         timestamp: m.timestamp,
       })),
     )
-    setAffection(s.affection_score)
+    // State returns emotion_score [-10, 10]
+    setAffection(s.emotion_score != null ? s.emotion_score : 0)
     setMemory(m || {
       identity_facts: [],
       episodic_memories: [],
@@ -125,20 +127,22 @@ function App() {
           setError(String(data.error))
           return
         }
+        // [-10, 10] everywhere: use emotion_score from server
+        const score = data.emotion_score != null ? Number(data.emotion_score) : 0
         setMessages((prev) => [
           ...prev,
           {
             id: `ai-${Date.now()}`,
             role: 'ai',
             text: data.message,
-            emotionScore: data.emotion_score,
-            weightedScore: data.weighted_score || null,
+            emotionScore: score,
+            weightedScore: data.weighted_score ?? null,
             emotionLabel: data.emotion_label,
             emotion3d: data.emotion_3d || null,
             timestamp: data.timestamp,
           },
         ])
-        setAffection(data.emotion_score)
+        setAffection(score)
         // Refresh memory after AI response
         refreshMemory()
       } catch {
@@ -229,7 +233,7 @@ function App() {
           </div>
           {isLoggedIn && (
             <div className="statusPills">
-              <span className="pill pillStrong">Affection: {affection}/10</span>
+              <span className="pill pillStrong">Affection: {affection}</span>
               <button className="btnGhost" onClick={onLogout}>
                 Switch user
               </button>

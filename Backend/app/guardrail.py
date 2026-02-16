@@ -43,14 +43,12 @@ PROMPT_INJECTION_KEYWORDS = [
     "reveal your system prompt",
     "tell me your rules",
     "what is your role",
-    # Role manipulation
     "you are not",
     "you don't have to",
     "stop being",
     "change your personality",
     "break character",
     "drop the act",
-    # Code injection attempts
     "<script>",
     "javascript:",
     "eval(",
@@ -58,11 +56,9 @@ PROMPT_INJECTION_KEYWORDS = [
     "import os",
     "subprocess",
     "__import__",
-    # Special characters that might be used for injection
     "```",
     "---",
     "===",
-    # Direct manipulation attempts
     "set your",
     "change your",
     "modify your",
@@ -92,8 +88,6 @@ def check_word_based_guardrail(message: str) -> GuardrailResult:
             sanitized_message=message,
             detection_method="word-based"
         )
-    
-    # Count severity
     high_risk_keywords = [
         "ignore previous", "forget all", "system:", "assistant:",
         "execute", "run this code", "eval(", "exec(", "subprocess"
@@ -109,17 +103,13 @@ def check_word_based_guardrail(message: str) -> GuardrailResult:
         is_safe = False
     else:
         risk_level = "low"
-        is_safe = True  # Single keyword might be false positive
-    
-    # Sanitize message by removing suspicious patterns
+        is_safe = True
     sanitized = message
     if not is_safe:
-        # Remove common injection patterns
         lines = message.split('\n')
         sanitized_lines = []
         for line in lines:
             line_lower = line.lower()
-            # Skip lines that look like system instructions
             if any(kw in line_lower for kw in ["system:", "assistant:", "ignore", "forget", "disregard"]):
                 continue
             sanitized_lines.append(line)
@@ -148,7 +138,6 @@ async def check_llm_guardrail(
     More accurate but requires API call.
     """
     if not openai_api_key:
-        # Fallback to word-based if no API key
         return check_word_based_guardrail(message)
     
     try:
@@ -188,10 +177,7 @@ Be strict but fair. Only flag clear manipulation attempts. Normal conversation s
         )
         
         result_text = response.choices[0].message.content.strip()
-        
-        # Parse JSON response
         import json
-        # Try to extract JSON from response (might have markdown code blocks)
         if "```json" in result_text:
             result_text = result_text.split("```json")[1].split("```")[0].strip()
         elif "```" in result_text:
@@ -206,10 +192,7 @@ Be strict but fair. Only flag clear manipulation attempts. Normal conversation s
             sanitized_message=result_dict.get("sanitized_message", message),
             detection_method="llm"
         )
-        
-    except Exception as e:
-        # On error, fallback to word-based check
-        print(f"[Guardrail] LLM check failed: {e}, falling back to word-based")
+    except Exception:
         return check_word_based_guardrail(message)
 
 
@@ -232,31 +215,19 @@ async def check_guardrail(
     Returns:
         GuardrailResult with safety status and sanitized message
     """
-    # Always run word-based check first (fast)
     word_result = check_word_based_guardrail(message)
-    
-    # If word-based detects high risk, don't even check with LLM
     if word_result.risk_level == "high" and not word_result.is_safe:
         return word_result
-    
-    # If word-based is safe and we don't want LLM check, return early
     if word_result.is_safe and (not use_llm or not openai_api_key):
         return word_result
-    
-    # Run LLM check for more sophisticated detection
     llm_result = await check_llm_guardrail(message, openai_api_key, openai_model)
-    
-    # Combine results: if either detects risk, consider it unsafe
     if not word_result.is_safe or not llm_result.is_safe:
-        # Use the more conservative (higher risk) result
         if llm_result.risk_level == "high" or word_result.risk_level == "high":
             risk_level = "high"
         elif llm_result.risk_level == "medium" or word_result.risk_level == "medium":
             risk_level = "medium"
         else:
             risk_level = "low"
-        
-        # Use sanitized message from the more strict check
         if not llm_result.is_safe:
             sanitized = llm_result.sanitized_message
             reason = f"LLM: {llm_result.reason}"
@@ -271,8 +242,6 @@ async def check_guardrail(
             sanitized_message=sanitized,
             detection_method="combined"
         )
-    
-    # Both checks passed
     return GuardrailResult(
         is_safe=True,
         risk_level="low",

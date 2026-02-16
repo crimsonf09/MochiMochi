@@ -1,11 +1,13 @@
 """
 Memory System for Chatbot
-Implements Identity Memory, Working Memory, Episodic Memory, and Semantic Profile
+Implements Identity Memory, Working Memory, Episodic Memory, and Semantic Profile.
+Uses LLM for semantic profile generation and working-memory summarization.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -13,9 +15,26 @@ from typing import Any
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 
-# ============================================================================
-# Identity Memory (Structured Facts)
-# ============================================================================
+async def _llm_chat(
+    prompt: str,
+    openai_api_key: str | None,
+    openai_model: str = "gpt-4o-mini",
+    timeout: float = 20.0
+) -> str | None:
+    """Single LLM call; returns content string or None if disabled/failed."""
+    if not openai_api_key:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_api_key, timeout=timeout)
+        response = client.chat.completions.create(
+            model=openai_model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception:
+        return None
+
 
 @dataclass
 class IdentityFact:
@@ -59,7 +78,6 @@ async def update_identity_memory(
                     }
                 )
         else:
-            # Insert new fact
             await coll.insert_one({
                 "username": username,
                 "key": key,
@@ -68,6 +86,85 @@ async def update_identity_memory(
                 "source_message": source_message,
                 "updated_at": now,
             })
+
+
+async def extract_identity_facts_with_llm(
+    messages: list[dict[str, Any]],
+    openai_api_key: str | None,
+    openai_model: str = "gpt-4o-mini"
+) -> dict[str, tuple[str, float]]:
+    """
+    Use LLM to extract identity facts about the user from recent conversation turns.
+    messages: list of {role, message} in chronological order.
+    Returns dict key -> (value, confidence) for update_identity_memory.
+    """
+    if not openai_api_key or not messages:
+        return {}
+    conv_text = "\n".join(
+        f"{m.get('role', 'unknown')}: {m.get('message', '')}"
+        for m in messages[-20:]  # last 20 turns
+    )
+    if len(conv_text) > 3500:
+        conv_text = conv_text[-3500:]
+    prompt = f"""From this conversation, extract only explicit facts about the USER (the human). Include only what the user clearly stated about themselves.
+
+Possible fact types: name (or nickname), birthday, age, job/work, preferences (likes/dislikes), goal, location, relationship status. Use short keys: name, birthday, age, job, preference_1, preference_2, goal, etc.
+
+Conversation:
+{conv_text}
+
+Return a JSON object with keys as fact names and values as the exact fact (string). Only include facts the user clearly stated. If nothing clear, return {{}}.
+Example: {{"name": "Alice", "job": "developer"}}
+JSON only, no other text:"""
+    raw = await _llm_chat(prompt, openai_api_key, openai_model, timeout=25.0)
+    if not raw:
+        return {}
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group(0))
+        facts = {}
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, (str, int, float)):
+                continue
+            val = str(v).strip()
+            if not val:
+                continue
+            conf = 0.9 if k in ("name", "birthday", "age", "job") else 0.8
+            facts[k] = (val[:500], conf)
+        return facts
+    except json.JSONDecodeError:
+        return {}
+
+
+async def update_identity_memory_from_conversation(
+    db: AsyncIOMotorDatabase,
+    username: str,
+    openai_api_key: str | None,
+    openai_model: str = "gpt-4o-mini",
+    last_n_turns: int = 10
+) -> int:
+    """
+    Get last N conversation turns, extract identity facts with LLM, and update identity memory.
+    Call every 5 turns to create/arrange identity facts. Returns number of facts written.
+    """
+    coll = db["chat_messages"]
+    cursor = (
+        coll.find({"username": username}, projection={"role": 1, "message": 1})
+        .sort("timestamp", -1)
+        .limit(last_n_turns * 2)  # user + ai turns
+    )
+    docs = await cursor.to_list(length=last_n_turns * 2)
+    messages = list(reversed(docs))  # chronological
+    if not messages:
+        return 0
+    facts = await extract_identity_facts_with_llm(messages, openai_api_key, openai_model)
+    if not facts:
+        return 0
+    source = messages[-1].get("message", "")[:200] if messages else ""
+    await update_identity_memory(db, username, facts, source_message=source)
+    return len(facts)
 
 
 async def get_identity_memory(
@@ -96,10 +193,6 @@ async def get_identity_memory(
     }
 
 
-# ============================================================================
-# Working Memory (Short-Term Context)
-# ============================================================================
-
 async def get_working_memory(
     db: AsyncIOMotorDatabase,
     username: str,
@@ -119,40 +212,48 @@ async def get_working_memory(
 async def trim_working_memory_if_needed(
     db: AsyncIOMotorDatabase,
     username: str,
-    max_tokens: int = 2000
+    max_tokens: int = 2000,
+    openai_api_key: str | None = None,
+    openai_model: str = "gpt-4o-mini"
 ) -> list[dict[str, Any]]:
     """
     Get working memory, trimming if token count exceeds limit.
-    If overflow, summarize older messages and move to episodic memory.
+    If overflow, use LLM to summarize older messages and store as episodic memory.
     """
-    messages = await get_working_memory(db, username, max_turns=20)  # Get more to check
-    
-    # Simple token estimation (rough: 1 token ≈ 4 characters)
+    messages = await get_working_memory(db, username, max_turns=20)
     total_chars = sum(len(m.get("message", "")) for m in messages)
     estimated_tokens = total_chars // 4
-    
+
     if estimated_tokens <= max_tokens:
-        return messages[:10]  # Return last 10
-    
-    # Need to trim - keep last 6, summarize older ones
+        return messages[-10:]  # last 10 (most recent)
+
     keep_messages = messages[-6:]
     older_messages = messages[:-6]
-    
-    if older_messages:
-        # Summarize older messages (simple concatenation for now)
-        # In production, you'd use LLM to summarize
-        summary = f"Previous conversation: {len(older_messages)} messages about various topics."
-        
-        # Store summary in episodic memory (will be created by episodic memory system)
-        # For now, just return the kept messages
-        pass
-    
+    if not older_messages:
+        return keep_messages
+    conversation_text = "\n".join(
+        f"{m.get('role', 'unknown')}: {m.get('message', '')}"
+        for m in older_messages
+    )
+    prompt = f"""Summarize this conversation in 2-4 short sentences. Capture the main topics, decisions, or feelings. Be concise.
+
+Conversation:
+{conversation_text[:4000]}
+
+Summary:"""
+    summary = await _llm_chat(prompt, openai_api_key, openai_model, timeout=15.0)
+    if not summary:
+        summary = f"Previous conversation: {len(older_messages)} messages."
+    event_embedding = None
+    if openai_api_key:
+        event_embedding = await generate_embedding(summary, openai_api_key, "text-embedding-3-small")
+    await create_episodic_memory(
+        db, username, summary, importance_score=0.4,
+        embedding=event_embedding,
+        metadata={"source": "working_memory_trim", "message_count": len(older_messages)}
+    )
     return keep_messages
 
-
-# ============================================================================
-# Episodic Memory (Event-Based Long-Term)
-# ============================================================================
 
 @dataclass
 class EpisodicMemory:
@@ -202,15 +303,11 @@ async def search_episodic_memory(
     Returns top K memories ranked by similarity + importance.
     """
     coll = db["episodic_memory"]
-    
-    # Get all memories for user
     cursor = coll.find({"username": username, "embedding": {"$ne": None}})
     all_memories = await cursor.to_list(length=1000)
     
     if not all_memories:
         return []
-    
-    # Calculate cosine similarity
     def cosine_similarity(a: list[float], b: list[float]) -> float:
         dot_product = sum(x * y for x, y in zip(a, b))
         norm_a = sum(x * x for x in a) ** 0.5
@@ -218,8 +315,6 @@ async def search_episodic_memory(
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot_product / (norm_a * norm_b)
-    
-    # Score each memory: similarity * importance
     scored = []
     for doc in all_memories:
         embedding = doc.get("embedding")
@@ -228,15 +323,11 @@ async def search_episodic_memory(
         
         similarity = cosine_similarity(query_embedding, embedding)
         importance = doc.get("importance_score", 0.5)
-        
-        # Combined score: weighted average
         score = (similarity * 0.6) + (importance * 0.4)
         
         scored.append((score, doc))
     
-    # Sort by score and return top K
     scored.sort(key=lambda x: x[0], reverse=True)
-    
     results = []
     for score, doc in scored[:top_k]:
         memory = EpisodicMemory(
@@ -248,8 +339,6 @@ async def search_episodic_memory(
             metadata=doc.get("metadata", {})
         )
         results.append(memory)
-        
-        # Increment access count and slightly boost importance
         await coll.update_one(
             {"_id": doc["_id"]},
             {
@@ -270,8 +359,6 @@ async def apply_time_decay_to_episodic_memory(
 ) -> None:
     """Apply time-based decay to episodic memory importance scores"""
     coll = db["episodic_memory"]
-    
-    # Calculate days since last update
     now = datetime.now(timezone.utc)
     
     cursor = coll.find({"username": username})
@@ -287,39 +374,33 @@ async def apply_time_decay_to_episodic_memory(
             )
 
 
-# ============================================================================
-# Semantic Profile (Behavior Patterns)
-# ============================================================================
-
 async def get_semantic_profile(
     db: AsyncIOMotorDatabase,
-    username: str
+    username: str,
+    openai_api_key: str | None = None,
+    openai_model: str = "gpt-4o-mini"
 ) -> dict[str, Any]:
     """Get or generate semantic profile from episodic memory"""
     coll = db["semantic_profile"]
-    
     profile = await coll.find_one({"username": username})
     if profile:
         return profile.get("profile", {})
-    
-    # Generate from episodic memory if doesn't exist
-    return await generate_semantic_profile(db, username)
+    return await generate_semantic_profile(db, username, openai_api_key, openai_model)
 
 
 async def generate_semantic_profile(
     db: AsyncIOMotorDatabase,
-    username: str
+    username: str,
+    openai_api_key: str | None = None,
+    openai_model: str = "gpt-4o-mini"
 ) -> dict[str, Any]:
-    """Generate semantic profile by analyzing episodic memory"""
+    """Generate semantic profile by analyzing episodic memory with LLM."""
     coll_episodic = db["episodic_memory"]
     coll_profile = db["semantic_profile"]
-    
-    # Get all episodic memories
     cursor = coll_episodic.find({"username": username}).sort("importance_score", -1).limit(20)
     memories = await cursor.to_list(length=20)
-    
+
     if not memories:
-        # Return empty profile
         profile = {
             "personality_summary": "No significant patterns detected yet.",
             "preferences": {},
@@ -327,16 +408,30 @@ async def generate_semantic_profile(
             "updated_at": datetime.now(timezone.utc)
         }
     else:
-        # Simple extraction (in production, use LLM to analyze)
-        summaries = [m.get("event_summary", "") for m in memories[:10]]
-        profile = {
-            "personality_summary": f"User has {len(memories)} significant interactions. Recent themes: {', '.join(summaries[:3])}.",
-            "preferences": {},
-            "behavior_patterns": summaries[:5],
-            "updated_at": datetime.now(timezone.utc)
-        }
-    
-    # Store profile
+        summaries = [m.get("event_summary", "") for m in memories[:15]]
+        memories_text = "\n".join(f"- {s}" for s in summaries if s)
+
+        if openai_api_key and memories_text:
+            prompt = f"""Based on these remembered events about the user, produce a short profile in JSON only.
+
+Events:
+{memories_text[:3500]}
+
+Return a single JSON object with exactly these keys (no other text):
+- "personality_summary": 2-4 sentences describing the user's style, recurring topics, and how they tend to interact.
+- "preferences": object with a few key preferences if evident (e.g. "communication_style": "...", "topics": ["..."]), or empty {{}}.
+- "behavior_patterns": array of 3-6 short strings (e.g. "Often shares personal updates", "Uses casual language").
+
+Example format:
+{{"personality_summary": "...", "preferences": {{}}, "behavior_patterns": ["...", "..."]}}
+"""
+            raw = await _llm_chat(prompt, openai_api_key, openai_model, timeout=25.0)
+            profile = _parse_semantic_profile_json(raw, len(memories), summaries)
+        else:
+            profile = _fallback_semantic_profile(memories, summaries)
+
+        profile["updated_at"] = datetime.now(timezone.utc)
+
     await coll_profile.update_one(
         {"username": username},
         {
@@ -348,13 +443,52 @@ async def generate_semantic_profile(
         },
         upsert=True
     )
-    
     return profile
 
 
-# ============================================================================
-# Embedding Generation
-# ============================================================================
+def _parse_semantic_profile_json(raw: str | None, memory_count: int, summaries: list[str]) -> dict[str, Any]:
+    """Parse LLM JSON response into semantic profile; fallback on invalid/missing."""
+    if not raw:
+        return _fallback_semantic_profile(
+            [{"event_summary": s} for s in summaries[:10]], summaries
+        )
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return _fallback_semantic_profile(
+            [{"event_summary": s} for s in summaries[:10]], summaries
+        )
+    try:
+        data = json.loads(match.group(0))
+        personality = (data.get("personality_summary") or "").strip()
+        if not personality:
+            raise ValueError("missing personality_summary")
+        prefs = data.get("preferences")
+        if not isinstance(prefs, dict):
+            prefs = {}
+        patterns = data.get("behavior_patterns")
+        if not isinstance(patterns, list):
+            patterns = [p for p in (patterns or "").split(",") if p.strip()][:6]
+        return {
+            "personality_summary": personality[:800],
+            "preferences": {str(k): str(v) for k, v in list(prefs.items())[:10]},
+            "behavior_patterns": [str(p).strip()[:200] for p in patterns[:8]],
+            "updated_at": datetime.now(timezone.utc)
+        }
+    except (json.JSONDecodeError, ValueError):
+        return _fallback_semantic_profile(
+            [{"event_summary": s} for s in summaries[:10]], summaries
+        )
+
+
+def _fallback_semantic_profile(memories: list[dict], summaries: list[str]) -> dict[str, Any]:
+    """Non-LLM fallback when API is off or parsing fails."""
+    return {
+        "personality_summary": f"User has {len(memories)} significant interactions. Recent themes: {', '.join(summaries[:3])}.",
+        "preferences": {},
+        "behavior_patterns": summaries[:5],
+        "updated_at": datetime.now(timezone.utc)
+    }
+
 
 async def generate_embedding(
     text: str,
@@ -373,25 +507,14 @@ async def generate_embedding(
             model=openai_model,
             input=text
         )
-        
         return response.data[0].embedding
-    except Exception as e:
-        print(f"[Memory] Failed to generate embedding: {e}")
+    except Exception:
         return None
 
 
-# ============================================================================
-# Memory Initialization
-# ============================================================================
-
 async def ensure_memory_indexes(db: AsyncIOMotorDatabase) -> None:
     """Create indexes for memory collections"""
-    # Identity memory indexes
     await db["identity_memory"].create_index([("username", 1), ("key", 1)], unique=True)
-    
-    # Episodic memory indexes
     await db["episodic_memory"].create_index([("username", 1), ("timestamp", -1)])
     await db["episodic_memory"].create_index([("username", 1), ("importance_score", -1)])
-    
-    # Semantic profile indexes
     await db["semantic_profile"].create_index([("username", 1)], unique=True)

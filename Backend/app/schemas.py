@@ -29,7 +29,7 @@ class ChatMessage(BaseModel):
 
 class ChatState(BaseModel):
     username: str
-    affection_score: int  # 0-10
+    emotion_score: int  # [-10, 10]
     persona_stage: str = ""  # Deprecated, kept for backward compatibility
 
 
@@ -40,9 +40,9 @@ class WsClientMessage(BaseModel):
 class WsServerMessage(BaseModel):
     role: Literal["ai"] = "ai"
     message: str
-    emotion_score: int
-    weighted_score: Optional[float] = None  # Weighted score before capping (for display)
-    emotion_label: str = ""  # Deprecated, kept for backward compatibility
+    emotion_score: int  # [-10, 10]
+    weighted_score: Optional[float] = None
+    emotion_label: str = ""  # Deprecated
     emotion_3d: Optional[Emotion3D] = None
     timestamp: datetime
 
