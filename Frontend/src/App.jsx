@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { fetchHistory, fetchMemory, fetchState, openChatWs } from './lib/api'
 
@@ -10,13 +10,45 @@ function App() {
   const [connStatus, setConnStatus] = useState('disconnected') // disconnected | connecting | connected
   const [affection, setAffection] = useState(0)
   const [error, setError] = useState('')
+  const [syncingHistory, setSyncingHistory] = useState(false)
+  const [lastHistorySyncAt, setLastHistorySyncAt] = useState(null)
   const [memory, setMemory] = useState(null)
   const [memoryLoading, setMemoryLoading] = useState(false)
+  const [memoryError, setMemoryError] = useState('')
+  const [memoryNextRefreshIn, setMemoryNextRefreshIn] = useState(3)
+  const [memoryLastRefreshedAt, setMemoryLastRefreshedAt] = useState(null)
+  /** Poll /api memory while chatting (Start / Stop). */
+  const [memoryMonitorLive, setMemoryMonitorLive] = useState(false)
+  /** When false, WebSocket sends memory_enabled: false (no retrieval writes / long-term updates). */
+  const [longTermMemoryEnabled, setLongTermMemoryEnabled] = useState(true)
 
   const wsRef = useRef(null)
   const listRef = useRef(null)
+  const memoryMonitorLiveRef = useRef(false)
+  const reconnectTimerRef = useRef(null)
+  const historySyncLockRef = useRef(false)
 
   const isLoggedIn = useMemo(() => username.trim().length > 0, [username])
+
+  function normalizeHistory(rawHistory) {
+    return [...rawHistory]
+      .sort((a, b) => {
+        const ta = a?.timestamp ? new Date(a.timestamp).getTime() : 0
+        const tb = b?.timestamp ? new Date(b.timestamp).getTime() : 0
+        if (ta !== tb) return ta - tb
+        return String(a?.id ?? '').localeCompare(String(b?.id ?? ''))
+      })
+      .map((m) => ({
+        id: m.id,
+        role: m.role,
+        text: m.message,
+        emotionScore: m.emotion_score != null ? Number(m.emotion_score) : 0,
+        weightedScore: m.weighted_score || null,
+        emotionLabel: m.emotion_label || '',
+        emotion3d: m.emotion_3d || null,
+        timestamp: m.timestamp,
+      }))
+  }
 
   function scrollToBottom() {
     const el = listRef.current
@@ -44,18 +76,7 @@ function App() {
       })
     ])
     // emotion_score from API is [-10, 10] everywhere
-    setMessages(
-      h.map((m) => ({
-        id: m.id,
-        role: m.role,
-        text: m.message,
-        emotionScore: m.emotion_score != null ? Number(m.emotion_score) : 0,
-        weightedScore: m.weighted_score || null,
-        emotionLabel: m.emotion_label || '',  // Deprecated, kept for backward compatibility
-        emotion3d: m.emotion_3d || null,
-        timestamp: m.timestamp,
-      })),
-    )
+    setMessages(normalizeHistory(h))
     // State returns emotion_score [-10, 10]
     setAffection(s.emotion_score != null ? s.emotion_score : 0)
     setMemory(m || {
@@ -66,38 +87,92 @@ function App() {
     })
   }
 
-  async function refreshMemory() {
+  const refreshMemory = useCallback(async () => {
     if (!username) return
     setMemoryLoading(true)
+    setMemoryError('')
     try {
-      console.log('[Frontend] Fetching memory for:', username)
       const m = await fetchMemory(username)
-      console.log('[Frontend] Memory received:', {
-        facts: m?.identity_facts?.length || 0,
-        episodic: m?.episodic_memories?.length || 0,
-        working: m?.working_memory_count || 0,
-        hasProfile: !!m?.semantic_profile
-      })
       setMemory(m || {
         identity_facts: [],
         episodic_memories: [],
         semantic_profile: null,
         working_memory_count: 0
       })
+      setMemoryLastRefreshedAt(new Date())
+      setMemoryNextRefreshIn(3)
     } catch (e) {
       console.error('[Frontend] Failed to refresh memory:', e)
-      setMemory({
-        identity_facts: [],
-        episodic_memories: [],
-        semantic_profile: null,
-        working_memory_count: 0
-      })
+      setMemoryError(e?.message || 'Memory refresh failed')
     } finally {
       setMemoryLoading(false)
+    }
+  }, [username])
+
+  useEffect(() => {
+    memoryMonitorLiveRef.current = memoryMonitorLive
+  }, [memoryMonitorLive])
+
+  useEffect(() => {
+    if (!isLoggedIn || !username.trim() || !memoryMonitorLive) return undefined
+    setMemoryNextRefreshIn(3)
+    refreshMemory()
+    const id = setInterval(() => refreshMemory(), 3000)
+    return () => clearInterval(id)
+  }, [isLoggedIn, username, memoryMonitorLive, refreshMemory])
+
+  useEffect(() => {
+    if (!isLoggedIn || !memoryMonitorLive) return undefined
+    const id = setInterval(() => {
+      setMemoryNextRefreshIn((prev) => (prev <= 1 ? 3 : prev - 1))
+    }, 1000)
+    return () => clearInterval(id)
+  }, [isLoggedIn, memoryMonitorLive])
+
+  useEffect(() => {
+    if (!isLoggedIn || !username.trim()) return undefined
+    syncHistoryFromBackend()
+    const id = setInterval(() => syncHistoryFromBackend(), 3000)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoggedIn, username])
+
+  function startMemoryMonitor() {
+    setMemoryMonitorLive(true)
+    setMemoryNextRefreshIn(3)
+  }
+
+  function stopMemoryMonitor() {
+    setMemoryMonitorLive(false)
+  }
+
+  const recentChatForMemoryPanel = useMemo(
+    () => messages.slice(-40),
+    [messages],
+  )
+
+  async function syncHistoryFromBackend() {
+    if (!username || historySyncLockRef.current) return
+    historySyncLockRef.current = true
+    setSyncingHistory(true)
+    try {
+      const [h, s] = await Promise.all([fetchHistory(username), fetchState(username)])
+      setMessages(normalizeHistory(h))
+      setAffection(s.emotion_score != null ? s.emotion_score : 0)
+      setLastHistorySyncAt(new Date())
+    } catch (e) {
+      console.error('[Frontend] Failed to sync history/state:', e)
+    } finally {
+      setSyncingHistory(false)
+      historySyncLockRef.current = false
     }
   }
 
   function disconnectWs() {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
     if (wsRef.current) {
       try {
         wsRef.current.close()
@@ -117,9 +192,20 @@ function App() {
     const ws = openChatWs(u)
     wsRef.current = ws
 
-    ws.onopen = () => setConnStatus('connected')
-    ws.onclose = () => setConnStatus('disconnected')
-    ws.onerror = () => setError('WebSocket error (backend down or proxy misconfigured).')
+    ws.onopen = () => {
+      setConnStatus('connected')
+      setError('')
+    }
+    ws.onclose = () => {
+      setConnStatus('disconnected')
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+      }
+      reconnectTimerRef.current = setTimeout(() => {
+        connectWs(u)
+      }, 1500)
+    }
+    ws.onerror = () => setError('WebSocket error (auto reconnecting)...')
     ws.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data)
@@ -127,24 +213,11 @@ function App() {
           setError(String(data.error))
           return
         }
-        // [-10, 10] everywhere: use emotion_score from server
+        // Keep backend history as source-of-truth, so Mochi matches Dmind history exactly.
         const score = data.emotion_score != null ? Number(data.emotion_score) : 0
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-${Date.now()}`,
-            role: 'ai',
-            text: data.message,
-            emotionScore: score,
-            weightedScore: data.weighted_score ?? null,
-            emotionLabel: data.emotion_label,
-            emotion3d: data.emotion_3d || null,
-            timestamp: data.timestamp,
-          },
-        ])
         setAffection(score)
-        // Refresh memory after AI response
-        refreshMemory()
+        syncHistoryFromBackend()
+        if (memoryMonitorLiveRef.current) refreshMemory()
       } catch {
         setError('Bad message from server.')
       }
@@ -165,6 +238,10 @@ function App() {
     return () => {
       cancelled = true
       disconnectWs()
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [username])
@@ -186,6 +263,8 @@ function App() {
     setComposer('')
     setError('')
     setAffection(0)
+    setMemoryMonitorLive(false)
+    memoryMonitorLiveRef.current = false
   }
 
   function sendMessage() {
@@ -197,22 +276,14 @@ function App() {
     }
 
     setError('')
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        text,
-        emotionScore: affection,
-        emotionLabel: '',  // No longer used
-        emotion3d: null, // Will be updated when message is processed
-        timestamp: new Date().toISOString(),
-      },
-    ])
     setComposer('')
-    wsRef.current.send(JSON.stringify({ message: text }))
-    // Refresh memory after sending message
-    setTimeout(() => refreshMemory(), 1000)
+    wsRef.current.send(
+      JSON.stringify({ message: text, memory_enabled: longTermMemoryEnabled }),
+    )
+    setTimeout(() => syncHistoryFromBackend(), 300)
+    if (memoryMonitorLive) {
+      setTimeout(() => refreshMemory(), 1000)
+    }
   }
 
   return (
@@ -220,7 +291,7 @@ function App() {
       <div className="panel chatPanel">
         <div className="topbar">
           <div className="brand">
-            <div className="brandTitle">Tsundere Chat (LangGraph + MongoDB)</div>
+            <div className="brandTitle">Mochi Chat (LangGraph + MongoDB)</div>
             <div className="brandMeta">
               {isLoggedIn ? (
                 <>
@@ -234,6 +305,9 @@ function App() {
           {isLoggedIn && (
             <div className="statusPills">
               <span className="pill pillStrong">Affection: {affection}</span>
+              <button className="btnGhost" onClick={syncHistoryFromBackend} disabled={syncingHistory}>
+                {syncingHistory ? 'Syncing...' : 'Sync from Dmind'}
+              </button>
               <button className="btnGhost" onClick={onLogout}>
                 Switch user
               </button>
@@ -278,38 +352,15 @@ function App() {
                   >
                     <div className={`bubble ${m.role === 'user' ? 'bubbleUser' : 'bubbleAi'}`}>
                       {m.text}
-                      {m.role === 'ai' && (
-                        <div className="bubbleMeta">
-                          <span className="badge">Affection: {m.emotionScore}</span>
-                          {m.weightedScore !== null && m.weightedScore !== undefined && (
-                            <span className="badge" style={{opacity: 0.7, fontSize: '0.85em'}}>
-                              Weighted: {m.weightedScore.toFixed(2)}
-                            </span>
-                          )}
-                          {m.emotion3d && (
-                            <div className="emotion3d">
-                              <span className="emotion3dLabel">V: {m.emotion3d.valence.toFixed(2)}</span>
-                              <span className="emotion3dLabel">A: {m.emotion3d.arousal.toFixed(2)}</span>
-                              <span className="emotion3dLabel">D: {m.emotion3d.dominance.toFixed(2)}</span>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {m.role === 'user' && m.emotion3d && (
-                        <div className="bubbleMeta">
-                          <div className="emotion3d">
-                            <span className="emotion3dLabel">V: {m.emotion3d.valence.toFixed(2)}</span>
-                            <span className="emotion3dLabel">A: {m.emotion3d.arousal.toFixed(2)}</span>
-                            <span className="emotion3dLabel">D: {m.emotion3d.dominance.toFixed(2)}</span>
-                          </div>
-                        </div>
-                      )}
                     </div>
                   </div>
                 ))}
               </div>
 
               {error && <div className="hint">Error: {error}</div>}
+              {isLoggedIn && lastHistorySyncAt && (
+                <div className="hint">Last synced: {lastHistorySyncAt.toLocaleTimeString()}</div>
+              )}
 
               <div className="composer">
                 <input
@@ -338,12 +389,81 @@ function App() {
         <div className="memorySidebar">
           <div className="memoryHeader">
             <h3>Memory System</h3>
-            <button className="btnGhost btnSmall" onClick={refreshMemory} disabled={memoryLoading}>
+            <button type="button" className="btnGhost btnSmall" onClick={refreshMemory} disabled={memoryLoading}>
               {memoryLoading ? '...' : '↻'}
             </button>
           </div>
 
-          <div className="memoryContent">
+          <div className="memoryToolbar">
+            <div className="memoryToolbarLabel">Live memory panel</div>
+            <div className="memoryToolbarRow">
+              <button
+                type="button"
+                className="btnStart"
+                onClick={startMemoryMonitor}
+                disabled={memoryMonitorLive}
+              >
+                Start
+              </button>
+              <button
+                type="button"
+                className="btnStop"
+                onClick={stopMemoryMonitor}
+                disabled={!memoryMonitorLive}
+              >
+                Stop
+              </button>
+              <span className={`memoryLiveBadge ${memoryMonitorLive ? 'on' : 'off'}`}>
+                {memoryMonitorLive ? `Live · refresh in ${memoryNextRefreshIn}s` : 'Paused'}
+              </span>
+            </div>
+            {memoryMonitorLive && (
+              <div className="hint" style={{ padding: 0, margin: 0 }}>
+                {memoryLastRefreshedAt
+                  ? `Last memory sync: ${memoryLastRefreshedAt.toLocaleTimeString()}`
+                  : 'Waiting first sync...'}
+              </div>
+            )}
+            {memoryError && (
+              <div className="hint" style={{ padding: 0, margin: 0, color: '#ff6b6b' }}>
+                Memory sync error: {memoryError}
+              </div>
+            )}
+            <label className="memoryToggle">
+              <input
+                type="checkbox"
+                checked={longTermMemoryEnabled}
+                onChange={(e) => setLongTermMemoryEnabled(e.target.checked)}
+              />
+              <span>Long-term memory (retrieve + learn from chat)</span>
+            </label>
+            {!longTermMemoryEnabled && (
+              <div className="hint" style={{ padding: 0, margin: 0 }}>
+                Off: replies use only recent chat in DB; identity / episodic / profile are skipped for this turn.
+              </div>
+            )}
+          </div>
+
+          <div className="memoryBody">
+            <div className="memorySection">
+              <h4>Current chat (UI)</h4>
+              {recentChatForMemoryPanel.length === 0 ? (
+                <div className="memoryEmpty">No messages in this session yet</div>
+              ) : (
+                <div className="memoryCurrentChat">
+                  {recentChatForMemoryPanel.map((m) => (
+                    <div
+                      key={m.id}
+                      className={`memoryTurn ${m.role === 'user' ? 'memoryTurnUser' : 'memoryTurnAi'}`}
+                    >
+                      <div className="memoryTurnRole">{m.role === 'user' ? 'You' : 'Mochi'}</div>
+                      {m.text}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* Identity Memory */}
             <div className="memorySection">
               <h4>Identity Facts</h4>
@@ -402,9 +522,9 @@ function App() {
 
             {/* Working Memory */}
             <div className="memorySection">
-              <h4>Working Memory</h4>
+              <h4>Working Memory (backend)</h4>
               <div className="memoryItem">
-                <div className="memoryItemValue">Last {memory?.working_memory_count || 0} conversation turns</div>
+                <div className="memoryItemValue">Last {memory?.working_memory_count || 0} conversation turns in graph context</div>
               </div>
             </div>
           </div>

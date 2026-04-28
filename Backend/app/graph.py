@@ -21,12 +21,13 @@ from .memory import (
     update_identity_memory_from_conversation,
 )
 from .security_agent import handle_dangerous_message
-from .tsundere import fallback_tsundere_response, persona_system_prompt
+from .tsundere import MOCHI_SYSTEM_PROMPT, normalize_mochi_reply
 
 
 class GraphState(TypedDict, total=False):
     username: str
     user_message: str
+    memory_enabled: bool
     history: list[dict[str, Any]]
     prev_score: int
     identity_facts: dict[str, Any]
@@ -55,12 +56,16 @@ class GraphDeps:
 async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphState:
     """Load all memory systems and conversation state"""
     username = state["username"]
+    memory_on = state.get("memory_enabled", True)
     coll = deps.db["chat_messages"]
-    working_memory = await trim_working_memory_if_needed(
-        deps.db, username, max_tokens=2000,
-        openai_api_key=deps.openai_api_key, openai_model=deps.openai_model
-    )
-    if not working_memory:
+    if memory_on:
+        working_memory = await trim_working_memory_if_needed(
+            deps.db, username, max_tokens=2000,
+            openai_api_key=deps.openai_api_key, openai_model=deps.openai_model
+        )
+        if not working_memory:
+            working_memory = await get_working_memory(deps.db, username, max_turns=10)
+    else:
         working_memory = await get_working_memory(deps.db, username, max_turns=10)
     history = working_memory
     latest_ai = await coll.find_one({"username": username, "role": "ai"}, sort=[("timestamp", -1)])
@@ -69,11 +74,15 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
         prev_score = max(-10, min(10, prev_score))
     else:
         prev_score = 0
-    identity_facts = await get_identity_memory(deps.db, username)
-    identity_dict = {k: v.value for k, v in identity_facts.items()}
-    semantic_profile = await get_semantic_profile(
-        deps.db, username, deps.openai_api_key, deps.openai_model
-    )
+    if memory_on:
+        identity_facts = await get_identity_memory(deps.db, username)
+        identity_dict = {k: v.value for k, v in identity_facts.items()}
+        semantic_profile = await get_semantic_profile(
+            deps.db, username, deps.openai_api_key, deps.openai_model
+        )
+    else:
+        identity_dict = {}
+        semantic_profile = {}
     prev_ai_emotion_3d = None
     if latest_ai and "emotion_3d" in latest_ai:
         prev_ai_emotion_3d = latest_ai.get("emotion_3d")
@@ -85,11 +94,14 @@ async def _load_history_and_state(state: GraphState, deps: GraphDeps) -> GraphSt
         "identity_facts": identity_dict,
         "semantic_profile": semantic_profile,
         "prev_ai_emotion_3d": prev_ai_emotion_3d,  # Store for use in LLM prompt
+        "memory_enabled": memory_on,
     }
 
 
 async def _classify_and_retrieve_memory(state: GraphState, deps: GraphDeps) -> GraphState:
     """Retrieve relevant episodic memories by embedding similarity (no classifier)."""
+    if not state.get("memory_enabled", True):
+        return {"episodic_memories": []}
     username = state["username"]
     user_message = state["user_message"]
 
@@ -317,29 +329,7 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
     Includes: system prompt, identity facts, episodic memories, semantic profile,
     working memory, and current user message.
     """
-    new_score = state.get("new_score", 0)
-    user_emotion_3d = state.get("user_emotion_3d", {})
-    ai_affection_score = max(0.0, min(10.0, (new_score + 10.0) / 2.0))
-    user_affection_score = state.get("user_affection_score")
-    if user_affection_score is None:
-        user_affection_score = calculate_affection_score_from_3d(user_emotion_3d)
-    prev_ai_emotion_3d = state.get("prev_ai_emotion_3d", {})
-    if prev_ai_emotion_3d:
-        ai_valence = prev_ai_emotion_3d.get("valence", 0.0)
-        ai_arousal = prev_ai_emotion_3d.get("arousal", 0.5)
-        ai_dominance = prev_ai_emotion_3d.get("dominance", 0.5)
-    else:
-        ai_valence = (ai_affection_score / 10.0) * 2.0 - 1.0
-        ai_arousal = 0.5
-        ai_dominance = 0.5
-    system_parts = [persona_system_prompt(
-        ai_affection=ai_affection_score,
-        user_affection=user_affection_score,
-        ai_valence=ai_valence,
-        ai_arousal=ai_arousal,
-        ai_dominance=ai_dominance,
-        character_name="Mochi"
-    )]
+    system_parts = [MOCHI_SYSTEM_PROMPT]
     identity_facts = state.get("identity_facts", {})
     if identity_facts:
         facts_text = "Known facts about the user:\n"
@@ -376,7 +366,7 @@ def _messages_for_llm(state: GraphState) -> list[dict[str, str]]:
 async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
     """
     Generate AI response using GPT via LangGraph node.
-    Falls back to deterministic responder if GPT is unavailable.
+    Requires OPENAI_API_KEY; on failure raises (no deterministic chat fallback).
     Includes retry logic with exponential backoff for rate limits.
     """
     new_score = state.get("new_score", 0)
@@ -386,84 +376,54 @@ async def _generate_response(state: GraphState, deps: GraphDeps) -> GraphState:
     if user_affection_score is None:
         user_affection_score = calculate_affection_score_from_3d(user_emotion_3d)
     
-    user_text = state["user_message"]
-    if deps.openai_api_key:
-        try:
-            from openai import OpenAI
-            from openai import APIError, AuthenticationError, RateLimitError
+    if not deps.openai_api_key:
+        raise RuntimeError(
+            "LLM is required but OPENAI_API_KEY is missing. Please set OPENAI_API_KEY in backend env."
+        )
 
-            client = OpenAI(
-                api_key=deps.openai_api_key,
-                timeout=30.0,
-                max_retries=3,
+    from openai import OpenAI
+    from openai import APIError, AuthenticationError, RateLimitError
+
+    client = OpenAI(
+        api_key=deps.openai_api_key,
+        timeout=30.0,
+        max_retries=3,
+    )
+    messages = _messages_for_llm(state)
+    max_retries = 3
+    base_delay = 2
+    ai_text = ""
+    for attempt in range(max_retries):
+        try:
+            completion = client.chat.completions.create(
+                model=deps.openai_model,
+                messages=messages,
+                temperature=0.8,
+                max_tokens=5000,
             )
-            messages = _messages_for_llm(state)
-            max_retries = 3
-            base_delay = 2
-            for attempt in range(max_retries):
-                try:
-                    completion = client.chat.completions.create(
-                        model=deps.openai_model,
-                        messages=messages,
-                        temperature=0.8,
-                        max_tokens=5000,
-                    )
-                    
-                    # Extract response
-                    ai_text = (completion.choices[0].message.content or "").strip()
-                    
-                    if ai_text:
-                        if attempt > 0:
-                            print(f"[LangGraph] ✓ GPT response generated (after {attempt} retries)")
-                        else:
-                            print(f"[LangGraph] ✓ GPT response generated (AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
-                        
-                        # Judge AI emotion after response is generated
-                        memory_context = {
-                            "identity_facts": state.get("identity_facts", {}),
-                            "episodic_memories": state.get("episodic_memories", []),
-                            "semantic_profile": state.get("semantic_profile", {}),
-                            "working_memory": state.get("working_memory", []),
-                        }
-                        
-                        ai_emotion = await judge_emotion_3d(
-                            message=ai_text,
-                            role="ai",
-                            memory_context=memory_context,
-                            openai_api_key=deps.openai_api_key,
-                            openai_model=deps.openai_model
-                        )
-                        if ai_emotion:
-                            ai_emotion_dict = {
-                                "valence": ai_emotion.valence,
-                                "arousal": ai_emotion.arousal,
-                                "dominance": ai_emotion.dominance,
-                                "impact": ai_emotion.impact
-                            }
-                        else:
-                            default = get_default_emotion_3d()
-                            ai_emotion_dict = {
-                                "valence": default.valence,
-                                "arousal": default.arousal,
-                                "dominance": default.dominance,
-                                "impact": default.impact
-                            }
-                        
-                        return {
-                            "ai_message": ai_text,
-                            "ai_emotion_3d": ai_emotion_dict
-                        }
-                    else:
-                        break
-                except RateLimitError:
-                    if attempt < max_retries - 1:
-                        wait_time = base_delay * (2 ** attempt)
-                        await asyncio.sleep(wait_time)
-                        continue
-                    break
-        except (AuthenticationError, APIError, Exception):
-            pass
-    ai_text = fallback_tsundere_response(user_text, ai_affection_score)
+            ai_text = normalize_mochi_reply(
+                (completion.choices[0].message.content or "").strip()
+            )
+            if ai_text:
+                if attempt > 0:
+                    print(f"[LangGraph] OK GPT response generated (after {attempt} retries)")
+                else:
+                    print(f"[LangGraph] OK GPT response generated (AI affection: {ai_affection_score:.1f}/10, User affection: {user_affection_score:.1f}/10)")
+                break
+        except RateLimitError:
+            if attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)
+                await asyncio.sleep(wait_time)
+                continue
+            raise RuntimeError("LLM rate-limited after retries. Please retry shortly.") from None
+        except AuthenticationError:
+            raise RuntimeError("LLM authentication failed. Check OPENAI_API_KEY.") from None
+        except APIError as e:
+            raise RuntimeError(f"LLM API error: {e}") from e
+
+    if not ai_text:
+        raise RuntimeError("LLM returned empty output. Check model availability/config.")
+
     memory_context = {
         "identity_facts": state.get("identity_facts", {}),
         "episodic_memories": state.get("episodic_memories", []),
@@ -565,12 +525,13 @@ async def _persist(state: GraphState, deps: GraphDeps) -> GraphState:
             "timestamp": ts,
         }
     )
-    message_count = await coll.count_documents({"username": username})
-    if message_count >= 5 and message_count % 5 == 0 and deps.openai_api_key:
-        await update_identity_memory_from_conversation(
-            deps.db, username, deps.openai_api_key, deps.openai_model, last_n_turns=10
-        )
-    await _update_memory_systems(state, deps)
+    if state.get("memory_enabled", True):
+        message_count = await coll.count_documents({"username": username})
+        if message_count >= 5 and message_count % 5 == 0 and deps.openai_api_key:
+            await update_identity_memory_from_conversation(
+                deps.db, username, deps.openai_api_key, deps.openai_model, last_n_turns=10
+            )
+        await _update_memory_systems(state, deps)
 
     return {"timestamp": ts}
 
@@ -582,8 +543,8 @@ def build_chat_graph(deps: GraphDeps):
     Flow:
     1. load -> Load conversation history and memory state from MongoDB
     2. classify -> Classify message and retrieve relevant episodic memories
-    3. judge_emotion -> Judge user emotion using LLM (3D: valence, arousal, dominance) and derive persona
-    4. respond -> Generate AI response using GPT (if API key set) or fallback, then judge AI emotion
+    3. judge_emotion -> Judge user emotion using LLM (3D: valence, arousal, dominance) and update scores
+    4. respond -> Generate AI response using GPT (requires API key), then judge AI emotion
     5. persist -> Save user message and AI response to MongoDB with 3D emotions
     
     Emotion System:
@@ -593,7 +554,7 @@ def build_chat_graph(deps: GraphDeps):
     
     GPT Integration:
     - If OPENAI_API_KEY is set, the 'respond' node calls GPT directly
-    - Messages include system prompt (tsundere persona), history, and current message
+    - Messages include constant system prompt (MOCHI_SYSTEM_PROMPT), history, and current message
     - GPT responses are generated through LangGraph node execution
     """
     g = StateGraph(GraphState)

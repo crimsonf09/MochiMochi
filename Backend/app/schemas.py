@@ -35,6 +35,7 @@ class ChatState(BaseModel):
 
 class WsClientMessage(BaseModel):
     message: str
+    memory_enabled: bool = True
 
 
 class WsServerMessage(BaseModel):
@@ -71,4 +72,12 @@ class MemoryData(BaseModel):
     episodic_memories: list[EpisodicMemory]
     semantic_profile: SemanticProfile
     working_memory_count: int
+
+
+class MirrorMessageIn(BaseModel):
+    id: str
+    role: str
+    name: str = ""
+    content: str
+    timestamp: datetime
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,9 +17,18 @@ from .memory import (
     get_semantic_profile,
     get_working_memory,
 )
-from .schemas import ChatMessage, ChatState, MemoryData, WsClientMessage, WsServerMessage
+from .schemas import (
+    ChatMessage,
+    ChatState,
+    MemoryData,
+    MirrorMessageIn,
+    WsClientMessage,
+    WsServerMessage,
+)
 from .security_agent import get_security_events
 from .settings import load_settings
+
+CHAT_NAMESPACE = "mochi"
 
 
 def _oid_to_str(v: Any) -> str:
@@ -53,13 +63,58 @@ def _serialize_doc(doc: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _mirror_role_to_chat_role(role: str, name: str) -> str:
+    role_l = (role or "").strip().lower()
+    name_l = (name or "").strip().lower()
+    if role_l == "user" or name_l == "user":
+        return "user"
+    return "ai"
+
+
+def _dmind_display_text(raw: str) -> str:
+    """If stored mirror text is still a DMind JSON payload, show inner content only."""
+    s = (raw or "").strip()
+    if not s or not s.startswith("{"):
+        return s
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict) and isinstance(obj.get("content"), str):
+            inner = obj["content"].strip()
+            if inner.startswith("{"):
+                try:
+                    nested = json.loads(inner)
+                    if isinstance(nested, dict) and isinstance(nested.get("content"), str):
+                        return nested["content"]
+                except json.JSONDecodeError:
+                    pass
+            return obj["content"]
+    except json.JSONDecodeError:
+        pass
+    return s
+
+
+def _scoped_username(username: str) -> str:
+    u = (username or "").strip()
+    if not u:
+        return f"{CHAT_NAMESPACE}:anonymous"
+    # Keep Dmind session usernames shared so Mochi can read that stream.
+    if u.startswith("dmind-"):
+        return u
+    return f"{CHAT_NAMESPACE}:{u}"
+
+
 load_dotenv()  # supports local env file usage without committing dotfiles
 settings = load_settings()
 
-app = FastAPI(title="Tsundere Chat Backend")
+app = FastAPI(title="Mochi Chat Backend")
 
 cors_origins = settings.cors_origins.copy()
-allow_origin_regex = r"https://.*\.vercel\.app"
+# Local Vite dev may use any port (5173, 5174, …) or 127.0.0.1 — match full Origin for CORSMiddleware.
+allow_origin_regex = (
+    r"(https://.*\.vercel\.app"
+    r"|http://localhost(?::\d+)?"
+    r"|http://127\.0\.0\.1(?::\d+)?)"
+)
 exact_origins = [o for o in cors_origins if "*" not in o and "vercel.app" not in o]
 vercel_urls = [o for o in cors_origins if "vercel.app" in o and "*" not in o]
 exact_origins.extend(vercel_urls)
@@ -101,15 +156,40 @@ async def _shutdown() -> None:
 @app.get("/")
 async def root():
     """Health check endpoint"""
-    return {"status": "ok", "service": "tsundere-chat-backend"}
+    return {"status": "ok", "service": "mochi-chat-backend"}
 
 
 @app.get("/chat/history/{username}", response_model=list[ChatMessage])
 async def get_chat_history(username: str):
     try:
+        scoped_username = _scoped_username(username)
         db = app.state.db
+        # For DMind bridge sessions, prefer exact mirrored DMind messages.
+        if scoped_username.startswith("dmind-"):
+            mirror_coll = db["dmind_mirror_messages"]
+            mirror_cursor = mirror_coll.find({"username": scoped_username}).sort("timestamp", 1)
+            mirror_docs = await mirror_cursor.to_list(length=20_000)
+            if mirror_docs:
+                serialized = []
+                for doc in mirror_docs:
+                    try:
+                        serialized.append(
+                            {
+                                "id": _oid_to_str(doc.get("_id")),
+                                "username": scoped_username,
+                                "role": _mirror_role_to_chat_role(doc.get("dmind_role", ""), doc.get("dmind_name", "")),
+                                "message": _dmind_display_text(str(doc.get("message", ""))),
+                                "emotion_score": 0,
+                                "emotion_label": "",
+                                "timestamp": doc.get("timestamp"),
+                            }
+                        )
+                    except Exception:
+                        continue
+                return serialized
+
         coll = db["chat_messages"]
-        cursor = coll.find({"username": username}).sort("timestamp", 1)
+        cursor = coll.find({"username": scoped_username}).sort("timestamp", 1)
         docs = await cursor.to_list(length=10_000)
         serialized = []
         for doc in docs:
@@ -122,13 +202,46 @@ async def get_chat_history(username: str):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
+@app.post("/chat/mirror/{username}")
+async def mirror_chat_history(username: str, messages: list[MirrorMessageIn]):
+    """
+    Replace mirrored DMind snapshot for the given username.
+    This enables Mochi frontend to render an exact DMind chat stream.
+    """
+    try:
+        scoped_username = _scoped_username(username)
+        db = app.state.db
+        coll = db["dmind_mirror_messages"]
+
+        await coll.delete_many({"username": scoped_username})
+        if not messages:
+            return {"ok": True, "username": scoped_username, "count": 0}
+
+        docs = [
+            {
+                "username": scoped_username,
+                "dmind_id": m.id,
+                "dmind_role": m.role,
+                "dmind_name": m.name,
+                "message": m.content,
+                "timestamp": m.timestamp,
+            }
+            for m in messages
+        ]
+        await coll.insert_many(docs)
+        return {"ok": True, "username": scoped_username, "count": len(docs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Mirror sync error: {str(e)}")
+
+
 @app.get("/chat/state/{username}", response_model=ChatState)
 async def get_chat_state(username: str):
     """Return current user state. emotion_score is in [-10, 10] (from latest AI message)."""
     try:
+        scoped_username = _scoped_username(username)
         db = app.state.db
         coll = db["chat_messages"]
-        latest_ai = await coll.find_one({"username": username, "role": "ai"}, sort=[("timestamp", -1)])
+        latest_ai = await coll.find_one({"username": scoped_username, "role": "ai"}, sort=[("timestamp", -1)])
         if latest_ai and "emotion_score" in latest_ai:
             emotion_score = max(-10, min(10, int(latest_ai.get("emotion_score", 0))))
         elif latest_ai and "emotion_3d" in latest_ai:
@@ -150,7 +263,7 @@ async def get_user_security_events(username: str, limit: int = 50):
     """
     try:
         db = app.state.db
-        events = await get_security_events(db, username=username, limit=limit)
+        events = await get_security_events(db, username=_scoped_username(username), limit=limit)
         return events
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -174,15 +287,16 @@ async def get_all_security_events(limit: int = 100):
 async def get_chat_memory(username: str):
     """Get all memory data for a user"""
     try:
+        scoped_username = _scoped_username(username)
         db = app.state.db
-        identity_facts_dict = await get_identity_memory(db, username)
+        identity_facts_dict = await get_identity_memory(db, scoped_username)
         identity_facts = [
             {"key": k, "value": v.value, "confidence": v.confidence}
             for k, v in identity_facts_dict.items()
         ]
         episodic_coll = db["episodic_memory"]
         episodic_cursor = (
-            episodic_coll.find({"username": username})
+            episodic_coll.find({"username": scoped_username})
             .sort("importance_score", -1)
             .limit(20)
         )
@@ -197,9 +311,9 @@ async def get_chat_memory(username: str):
             for doc in episodic_docs
         ]
         semantic_profile = await get_semantic_profile(
-            db, username, settings.openai_api_key, settings.openai_model
+            db, scoped_username, settings.openai_api_key, settings.openai_model
         )
-        working_memory = await get_working_memory(db, username, max_turns=10)
+        working_memory = await get_working_memory(db, scoped_username, max_turns=10)
         result = {
             "identity_facts": identity_facts,
             "episodic_memories": episodic_memories,
@@ -219,6 +333,7 @@ async def get_chat_memory(username: str):
 async def ws_chat(websocket: WebSocket, username: str):
     await websocket.accept()
     graph = app.state.graph
+    scoped_username = _scoped_username(username)
 
     try:
         while True:
@@ -226,10 +341,22 @@ async def ws_chat(websocket: WebSocket, username: str):
             try:
                 client_msg = WsClientMessage.model_validate(payload)
             except Exception:
-                await websocket.send_json({"error": "Invalid message format. Expected: { message: string }"})
+                await websocket.send_json(
+                    {"error": "Invalid message format. Expected: { message: string, memory_enabled?: boolean }"}
+                )
                 continue
 
-            result = await graph.ainvoke({"username": username, "user_message": client_msg.message})
+            try:
+                result = await graph.ainvoke(
+                    {
+                        "username": scoped_username,
+                        "user_message": client_msg.message,
+                        "memory_enabled": client_msg.memory_enabled,
+                    }
+                )
+            except Exception as e:
+                await websocket.send_json({"error": f"LLM unavailable: {str(e)}"})
+                continue
             ai_emotion_3d = result.get("ai_emotion_3d")
             from .schemas import Emotion3D
             emotion_3d_obj = None
